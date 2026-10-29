@@ -6,8 +6,11 @@ This file is for coding agents that change this repository. People can read it t
 
 | Path | What it holds |
 | --- | --- |
-| `src/index.ts` | Entry point. Calls `run()` in `src/main.ts` |
-| `src/main.ts` | GitHub API calls: reads the PR, writes the comment, labels, and status, and runs the sweep |
+| `src/index.ts` | Action entry point. Calls `run()` in `src/main.ts` |
+| `src/main.ts` | The action: inputs, writes (comment, labels, review requests, status), and the sweep |
+| `src/evaluate.ts` | The read-only half: reads a PR through the API and decides (`judgePr`). Shared by the action and the CLI |
+| `src/cli.ts` | The `check` CLI: arguments, settings, and the JSON verdict |
+| `src/bin.ts` | CLI entry point. Calls `cli()` in `src/cli.ts` |
 | `src/gate.ts` | The decision (`decide`), the comment (`renderComment`), the owner override, and `GATE_CONTROL_FILES` |
 | `src/evidence.ts` | Section parsing and the rule that decides whether a line is real content |
 | `src/config.ts` | `.review-gate.yml` parsing and the defaults (`defaultConfig`, `DEFAULT_SECTIONS`) |
@@ -22,6 +25,7 @@ This file is for coding agents that change this repository. People can read it t
 | `test/` | Vitest tests. `placeholders.test.ts` builds the evidence matrix from `docs/evidence-rule.md` |
 | `docs/evidence-rule.md` | The evidence rule and its worked examples |
 | `dist/index.js` | The bundled action that `action.yml` runs. Generated, but committed |
+| `dist/cli.js` | The bundled CLI (`bin` in `package.json`). Generated, but committed |
 | `examples/` | Workflows for repositories that use the action |
 | `.github/workflows/ci.yml` | Lint, types, tests, build, and a check that `dist/` is fresh |
 | `.github/workflows/gate.yml` | This repository's own gate run. A smoke test, not a required check |
@@ -35,7 +39,7 @@ npm ci
 npm run all
 ```
 
-`npm run all` runs lint, the type check, the tests, and the build. The build rewrites `dist/index.js`. Commit `dist/index.js` in the same commit as the source change. CI fails when `dist/` doesn't match the source.
+`npm run all` runs lint, the type check, the tests, and the build. The build rewrites `dist/index.js` and `dist/cli.js`. Commit both in the same commit as the source change. CI fails when `dist/` doesn't match the source.
 
 ## Change the evidence rule spec first
 

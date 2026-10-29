@@ -34565,136 +34565,6 @@ function forcedIntoScope(cfg, fileObjs, changedFiles) {
   return null;
 }
 
-// src/ci.ts
-var import_yaml2 = __toESM(require_dist());
-var OK = /* @__PURE__ */ new Set(["success", "neutral", "skipped"]);
-function evaluateCi(checks, statuses, ignore) {
-  const skip = new Set(ignore.names.map((n) => n.toLowerCase()));
-  const job = ignore.job?.toLowerCase();
-  const gate = ignore.gateSuites ? new Set(ignore.gateSuites) : null;
-  const res = { state: "none", failing: [], pending: [], passed: [] };
-  for (const c of checks) {
-    if (skip.has(c.name.toLowerCase())) continue;
-    if (job && c.name.toLowerCase() === job && (!gate || c.suiteId != null && gate.has(c.suiteId))) continue;
-    if (ignore.runId && c.url && c.url.includes(`/actions/runs/${ignore.runId}/`)) continue;
-    if (c.status !== "completed") res.pending.push(c.name);
-    else if (OK.has(c.conclusion ?? "")) res.passed.push(c.name);
-    else res.failing.push(`${c.name} (${c.conclusion ?? "unknown"})`);
-  }
-  const seen = /* @__PURE__ */ new Set();
-  for (const s of statuses) {
-    if (seen.has(s.context)) continue;
-    seen.add(s.context);
-    if (skip.has(s.context.toLowerCase())) continue;
-    if (s.state === "success") res.passed.push(s.context);
-    else if (s.state === "pending") res.pending.push(s.context);
-    else res.failing.push(`${s.context} (${s.state})`);
-  }
-  if (res.failing.length) res.state = "failing";
-  else if (res.pending.length) res.state = "pending";
-  else if (res.passed.length) res.state = "green";
-  return res;
-}
-function gateJobNames(text, uses) {
-  const out = /* @__PURE__ */ new Set();
-  let doc;
-  try {
-    doc = (0, import_yaml2.parse)(text);
-  } catch {
-    return out;
-  }
-  const jobs = doc?.jobs;
-  if (!jobs || typeof jobs !== "object") return out;
-  for (const [id, job] of Object.entries(jobs)) {
-    const steps = Array.isArray(job?.steps) ? job.steps : [];
-    if (!steps.some((s) => typeof s?.uses === "string" && uses(s.uses))) continue;
-    out.add((typeof job.name === "string" ? job.name : id).toLowerCase());
-  }
-  return out;
-}
-async function gateSuites(checks, ignore, sha, defaultBranch, uses, lookup) {
-  const job = ignore.job.toLowerCase();
-  const candidates = checks.filter(
-    (c) => c.name.toLowerCase() === job && c.suiteId != null && !(ignore.runId && c.url && c.url.includes(`/actions/runs/${ignore.runId}/`))
-  );
-  if (!candidates.length) return [];
-  const want = new Set(candidates.map((c) => c.suiteId));
-  let runs = await lookup.runs(sha, false);
-  if ([...want].some((id) => !runs.some((r) => r.checkSuiteId === id))) runs = await lookup.runs(sha, true);
-  const out = [];
-  for (const r of runs) {
-    if (!want.has(r.checkSuiteId)) continue;
-    const ref = r.event === "pull_request_target" ? defaultBranch : r.headSha;
-    const text = await lookup.workflow(r.path.split("@")[0], ref);
-    if (text !== null && gateJobNames(text, uses).has(job)) out.push(r.checkSuiteId);
-  }
-  return out;
-}
-
-// src/codeowners.ts
-function parseCodeowners(text) {
-  const rules = [];
-  text.split(/\r?\n/).forEach((raw, i) => {
-    const line = raw.replace(/(^|\s)#.*$/, "").trim();
-    if (!line) return;
-    const [pattern, ...owners] = line.split(/\s+/);
-    if (pattern) rules.push({ pattern, owners: owners.filter((o) => o.startsWith("@") || o.includes("@")), line: i + 1 });
-  });
-  return rules;
-}
-function codeownersMatch(file, pattern) {
-  let p = pattern;
-  const dirOnly = p.endsWith("/");
-  p = p.replace(/\/+$/, "");
-  const anchored = p.startsWith("/") || p.includes("/");
-  p = p.replace(/^\/+/, "");
-  if (!p) return false;
-  const opts = { dot: true };
-  const glob = anchored || p.startsWith("**") ? p : `**/${p}`;
-  const last = p.split("/").pop() ?? "";
-  if (dirOnly) return minimatch(file, `${glob}/**`, opts);
-  if (minimatch(file, glob, opts)) return true;
-  return !last.includes("*") && minimatch(file, `${glob}/**`, opts);
-}
-function ownersFor(file, rules) {
-  let owners = [];
-  for (const r of rules) if (codeownersMatch(file, r.pattern)) owners = r.owners;
-  return owners;
-}
-function splitOwners(owners) {
-  const users = /* @__PURE__ */ new Set();
-  const teams = /* @__PURE__ */ new Set();
-  for (const o of owners) {
-    if (!o.startsWith("@")) continue;
-    const name = o.slice(1);
-    if (name.includes("/")) teams.add(name);
-    else users.add(name);
-  }
-  return { users: [...users].sort(), teams: [...teams].sort() };
-}
-function codeownerCoverage(files, rules, approvers, author, isMember) {
-  const lower = (s) => s.toLowerCase();
-  return [...new Set(files)].map((file) => {
-    const owners = ownersFor(file, rules);
-    const { users, teams } = splitOwners(owners);
-    if (users.length === 0 && teams.length === 0) return { file, owners, approvedBy: [], status: "no-owner" };
-    const approvedBy = new Set(approvers.filter((a) => users.map(lower).includes(lower(a))));
-    let unknown = false;
-    for (const t of teams) {
-      for (const a of approvers) {
-        const m = isMember(t, a);
-        if (m === true) approvedBy.add(a);
-        else if (m === null) unknown = true;
-      }
-    }
-    if (approvedBy.size) return { file, owners, approvedBy: [...approvedBy].sort(), status: "approved" };
-    if (owners.every((o) => lower(o) === `@${lower(author)}`)) {
-      return { file, owners, approvedBy: [], status: "author-only" };
-    }
-    return { file, owners, approvedBy: [], status: unknown ? "team-unknown" : "pending" };
-  });
-}
-
 // src/reviews.ts
 function isBotLogin(login, type) {
   return type === "Bot" || /\[bot\]$/i.test(login);
@@ -34920,13 +34790,137 @@ async function runEach(prs, fn, log, beforeEach) {
   return { outcomes, stoppedEarly: null };
 }
 
-// src/main.ts
-var LABEL_COLORS = {
-  "risk:low": "0e8a16",
-  "risk:medium": "fbca04",
-  "risk:high": "b60205",
-  "needs-human": "5319e7"
-};
+// src/ci.ts
+var import_yaml2 = __toESM(require_dist());
+var OK = /* @__PURE__ */ new Set(["success", "neutral", "skipped"]);
+function evaluateCi(checks, statuses, ignore) {
+  const skip = new Set(ignore.names.map((n) => n.toLowerCase()));
+  const job = ignore.job?.toLowerCase();
+  const gate = ignore.gateSuites ? new Set(ignore.gateSuites) : null;
+  const res = { state: "none", failing: [], pending: [], passed: [] };
+  for (const c of checks) {
+    if (skip.has(c.name.toLowerCase())) continue;
+    if (job && c.name.toLowerCase() === job && (!gate || c.suiteId != null && gate.has(c.suiteId))) continue;
+    if (ignore.runId && c.url && c.url.includes(`/actions/runs/${ignore.runId}/`)) continue;
+    if (c.status !== "completed") res.pending.push(c.name);
+    else if (OK.has(c.conclusion ?? "")) res.passed.push(c.name);
+    else res.failing.push(`${c.name} (${c.conclusion ?? "unknown"})`);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  for (const s of statuses) {
+    if (seen.has(s.context)) continue;
+    seen.add(s.context);
+    if (skip.has(s.context.toLowerCase())) continue;
+    if (s.state === "success") res.passed.push(s.context);
+    else if (s.state === "pending") res.pending.push(s.context);
+    else res.failing.push(`${s.context} (${s.state})`);
+  }
+  if (res.failing.length) res.state = "failing";
+  else if (res.pending.length) res.state = "pending";
+  else if (res.passed.length) res.state = "green";
+  return res;
+}
+function gateJobNames(text, uses) {
+  const out = /* @__PURE__ */ new Set();
+  let doc;
+  try {
+    doc = (0, import_yaml2.parse)(text);
+  } catch {
+    return out;
+  }
+  const jobs = doc?.jobs;
+  if (!jobs || typeof jobs !== "object") return out;
+  for (const [id, job] of Object.entries(jobs)) {
+    const steps = Array.isArray(job?.steps) ? job.steps : [];
+    if (!steps.some((s) => typeof s?.uses === "string" && uses(s.uses))) continue;
+    out.add((typeof job.name === "string" ? job.name : id).toLowerCase());
+  }
+  return out;
+}
+async function gateSuites(checks, ignore, sha, defaultBranch, uses, lookup) {
+  const job = ignore.job.toLowerCase();
+  const candidates = checks.filter(
+    (c) => c.name.toLowerCase() === job && c.suiteId != null && !(ignore.runId && c.url && c.url.includes(`/actions/runs/${ignore.runId}/`))
+  );
+  if (!candidates.length) return [];
+  const want = new Set(candidates.map((c) => c.suiteId));
+  let runs = await lookup.runs(sha, false);
+  if ([...want].some((id) => !runs.some((r) => r.checkSuiteId === id))) runs = await lookup.runs(sha, true);
+  const out = [];
+  for (const r of runs) {
+    if (!want.has(r.checkSuiteId)) continue;
+    const ref = r.event === "pull_request_target" ? defaultBranch : r.headSha;
+    const text = await lookup.workflow(r.path.split("@")[0], ref);
+    if (text !== null && gateJobNames(text, uses).has(job)) out.push(r.checkSuiteId);
+  }
+  return out;
+}
+
+// src/codeowners.ts
+function parseCodeowners(text) {
+  const rules = [];
+  text.split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.replace(/(^|\s)#.*$/, "").trim();
+    if (!line) return;
+    const [pattern, ...owners] = line.split(/\s+/);
+    if (pattern) rules.push({ pattern, owners: owners.filter((o) => o.startsWith("@") || o.includes("@")), line: i + 1 });
+  });
+  return rules;
+}
+function codeownersMatch(file, pattern) {
+  let p = pattern;
+  const dirOnly = p.endsWith("/");
+  p = p.replace(/\/+$/, "");
+  const anchored = p.startsWith("/") || p.includes("/");
+  p = p.replace(/^\/+/, "");
+  if (!p) return false;
+  const opts = { dot: true };
+  const glob = anchored || p.startsWith("**") ? p : `**/${p}`;
+  const last = p.split("/").pop() ?? "";
+  if (dirOnly) return minimatch(file, `${glob}/**`, opts);
+  if (minimatch(file, glob, opts)) return true;
+  return !last.includes("*") && minimatch(file, `${glob}/**`, opts);
+}
+function ownersFor(file, rules) {
+  let owners = [];
+  for (const r of rules) if (codeownersMatch(file, r.pattern)) owners = r.owners;
+  return owners;
+}
+function splitOwners(owners) {
+  const users = /* @__PURE__ */ new Set();
+  const teams = /* @__PURE__ */ new Set();
+  for (const o of owners) {
+    if (!o.startsWith("@")) continue;
+    const name = o.slice(1);
+    if (name.includes("/")) teams.add(name);
+    else users.add(name);
+  }
+  return { users: [...users].sort(), teams: [...teams].sort() };
+}
+function codeownerCoverage(files, rules, approvers, author, isMember) {
+  const lower = (s) => s.toLowerCase();
+  return [...new Set(files)].map((file) => {
+    const owners = ownersFor(file, rules);
+    const { users, teams } = splitOwners(owners);
+    if (users.length === 0 && teams.length === 0) return { file, owners, approvedBy: [], status: "no-owner" };
+    const approvedBy = new Set(approvers.filter((a) => users.map(lower).includes(lower(a))));
+    let unknown = false;
+    for (const t of teams) {
+      for (const a of approvers) {
+        const m = isMember(t, a);
+        if (m === true) approvedBy.add(a);
+        else if (m === null) unknown = true;
+      }
+    }
+    if (approvedBy.size) return { file, owners, approvedBy: [...approvedBy].sort(), status: "approved" };
+    if (owners.every((o) => lower(o) === `@${lower(author)}`)) {
+      return { file, owners, approvedBy: [], status: "author-only" };
+    }
+    return { file, owners, approvedBy: [], status: unknown ? "team-unknown" : "pending" };
+  });
+}
+
+// src/evaluate.ts
 function isNotFound(e) {
   return typeof e === "object" && e !== null && e.status === 404;
 }
@@ -34941,6 +34935,237 @@ async function readFile(octokit, repo, filePath, ref) {
     throw e;
   }
 }
+var runsBySha = /* @__PURE__ */ new Map();
+var workflowFiles = /* @__PURE__ */ new Map();
+var gateLookupWarned = false;
+function gateLookup(octokit, repo) {
+  return {
+    runs: (sha, refresh) => {
+      if (refresh || !runsBySha.has(sha)) {
+        const p = octokit.paginate(octokit.rest.actions.listWorkflowRunsForRepo, { ...repo, head_sha: sha, per_page: 100 }).then((runs) => runs.map((r) => ({ checkSuiteId: r.check_suite_id ?? 0, path: r.path ?? "", event: r.event, headSha: r.head_sha })));
+        runsBySha.set(sha, p);
+        p.catch(() => runsBySha.delete(sha));
+      }
+      return runsBySha.get(sha);
+    },
+    workflow: (path3, ref) => {
+      const key = `${path3}@${ref}`;
+      if (!workflowFiles.has(key)) {
+        const p = readFile(octokit, repo, path3, ref);
+        workflowFiles.set(key, p);
+        p.catch(() => workflowFiles.delete(key));
+      }
+      return workflowFiles.get(key);
+    }
+  };
+}
+async function readCi(octokit, repo, s, sha, defaultBranch, ignoreNames) {
+  const checks = await octokit.paginate(octokit.rest.checks.listForRef, { ...repo, ref: sha, per_page: 100, filter: "latest" });
+  const statuses = await octokit.paginate(octokit.rest.repos.listCommitStatusesForRef, { ...repo, ref: sha, per_page: 100 });
+  const lite = checks.map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion, url: c.details_url ?? c.html_url, suiteId: c.check_suite?.id ?? null }));
+  const { job, runId } = s;
+  let suites;
+  try {
+    suites = await gateSuites(lite, { job, runId }, sha, defaultBranch, s.usesThisAction, gateLookup(octokit, repo));
+  } catch (e) {
+    if (!gateLookupWarned) s.log.warning(`Could not map checks to workflow runs (${e.message}); skipping every check named "${job}". Grant actions: read to fix this.`);
+    gateLookupWarned = true;
+  }
+  return evaluateCi(lite, statuses.map((st) => ({ context: st.context, state: st.state })), { names: ignoreNames, runId, job, gateSuites: suites });
+}
+async function waitForCi(octokit, repo, s, sha, defaultBranch, ignoreNames, waitSeconds) {
+  const deadline = Date.now() + waitSeconds * 1e3;
+  let ci = await readCi(octokit, repo, s, sha, defaultBranch, ignoreNames);
+  while ((ci.state === "pending" || ci.state === "none") && Date.now() < deadline) {
+    s.log.info(`CI is ${ci.state}; waiting (pending: ${ci.pending.join(", ") || "none yet"})`);
+    await new Promise((r) => setTimeout(r, 15e3));
+    ci = await readCi(octokit, repo, s, sha, defaultBranch, ignoreNames);
+  }
+  return ci;
+}
+async function dismissedOriginalStates(octokit, repo, s, pr) {
+  const out = /* @__PURE__ */ new Map();
+  try {
+    const events = await octokit.paginate(octokit.rest.issues.listEventsForTimeline, { ...repo, issue_number: pr, per_page: 100 });
+    for (const e of events) {
+      if (e.event === "review_dismissed" && e.dismissed_review?.review_id && e.dismissed_review.state) {
+        out.set(e.dismissed_review.review_id, e.dismissed_review.state);
+      }
+    }
+  } catch (err) {
+    s.log.warning(`Could not read the PR timeline: ${err.message}. Rounds are unknown; the gate blocks.`);
+    return null;
+  }
+  return out;
+}
+async function loadConfig(octokit, repo, s, ref) {
+  const text = await readFile(octokit, repo, s.configPath, ref);
+  if (text === null) {
+    s.log.warning(`${s.configPath} not found at ${ref}; using defaults (every file gets the default tier).`);
+    return { ...defaultConfig(s.configPath), missing: true };
+  }
+  return parseConfig(text, s.configPath);
+}
+async function codeownersState(octokit, repo, cfg, tier, highFiles, baseSha, approvers, author) {
+  const empty = { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] };
+  if (tier !== "high" || !cfg.highRequiresCodeowners) return empty;
+  let text = null;
+  for (const p of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
+    text = await readFile(octokit, repo, p, baseSha);
+    if (text !== null) break;
+  }
+  if (text === null) {
+    return { ...empty, required: true, satisfied: false, missingFile: true, note: `No CODEOWNERS file on the base branch. Add one, or set routing.high_requires_codeowners: false in ${cfg.path}.` };
+  }
+  const rules = parseCodeowners(text);
+  const owners = splitOwners([...new Set(highFiles.flatMap((f) => ownersFor(f, rules)))]);
+  const membership = /* @__PURE__ */ new Map();
+  let teamNote;
+  for (const team of owners.teams) {
+    const [org, slug] = team.split("/");
+    for (const a of approvers) {
+      let v;
+      try {
+        const m = await octokit.rest.teams.getMembershipForUserInOrg({ org, team_slug: slug, username: a });
+        v = m.data.state === "active";
+      } catch {
+        v = null;
+      }
+      if (v === null) teamNote = `Could not confirm membership of @${team} with this token (404 or no org access). Branch protection must enforce the team review.`;
+      membership.set(`${team}
+${a.toLowerCase()}`, v);
+    }
+  }
+  if (owners.teams.length && approvers.length === 0) {
+    teamNote = `Team owners (${owners.teams.map((t) => "@" + t).join(", ")}) can only be verified when this token can read org teams. Otherwise branch protection must enforce the team review.`;
+  }
+  const coverage = codeownerCoverage(highFiles, rules, approvers, author, (team, user) => membership.get(`${team}
+${user.toLowerCase()}`) ?? null);
+  const satisfied = coverage.length > 0 && coverage.every((c) => c.status === "approved");
+  const approvedBy = [...new Set(coverage.flatMap((c) => c.approvedBy))].sort();
+  return { required: true, owners, approvedBy, satisfied, coverage, requested: [], note: satisfied ? void 0 : teamNote };
+}
+function toInputs(pr, reviews, who) {
+  return toPrInputs({ headSha: pr.head.sha, baseSha: pr.base.sha, body: pr.body ?? null, draft: Boolean(pr.draft) }, reviews, who);
+}
+function configFor(octokit, repo, s, pr) {
+  return loadConfig(octokit, repo, s, configRefs(s.configRef, pr).rules);
+}
+function scopePr(pr) {
+  const login = pr.user?.login ?? "";
+  return { author: login, isBot: isBotLogin(login, pr.user?.type), labels: (pr.labels ?? []).map((l) => typeof l === "string" ? l : l.name ?? "") };
+}
+function scopeConfigFor(octokit, repo, s, pr) {
+  return loadConfig(octokit, repo, s, configRefs(s.configRef, pr).scope);
+}
+function ciIgnores(cfg, s) {
+  return [...cfg.ignoreChecks, ...s.ignoreChecks];
+}
+async function listReviews(octokit, repo, prNumber) {
+  const raw = await octokit.paginate(octokit.rest.pulls.listReviews, { ...repo, pull_number: prNumber, per_page: 100 });
+  return raw.map((r) => ({
+    id: r.id,
+    user: r.user?.login ?? "",
+    isBot: isBotLogin(r.user?.login ?? "", r.user?.type),
+    state: r.state,
+    submittedAt: r.submitted_at ?? null,
+    commitId: r.commit_id ?? null,
+    association: r.author_association
+  }));
+}
+async function currentInputsKey(octokit, repo, prNumber, who) {
+  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
+  if (pr.state !== "open") return null;
+  return inputsKey(toInputs(pr, await listReviews(octokit, repo, prNumber), who));
+}
+async function evaluatePr(octokit, repo, s, prNumber, ciWaitSeconds, scopeNote) {
+  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
+  if (pr.state !== "open") return null;
+  const author = pr.user?.login ?? "";
+  const cfg = scopeNote ? await scopeConfigFor(octokit, repo, s, pr) : await configFor(octokit, repo, s, pr);
+  const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
+  const files = fileObjs.flatMap((f) => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
+  const tier = classify(files, cfg, { total: pr.changed_files, seen: fileObjs.length });
+  s.log.info(`Tier: ${tier.tier} (${tier.triggers.map((t) => t.file).join(", ") || "default"})`);
+  const evidence = checkEvidence(pr.body, cfg.sections);
+  const reviews = await listReviews(octokit, repo, prNumber);
+  const approval = approvalsFor(reviews, author, {
+    headSha: pr.head.sha,
+    allowStale: cfg.allowStaleApprovals,
+    trustedAssociations: cfg.trustedAssociations
+  });
+  const approvers = approval.approvers;
+  const rounds = countRounds(reviews, {
+    headSha: pr.head.sha,
+    dismissedOriginal: reviews.some((r) => r.state === "DISMISSED") ? await dismissedOriginalStates(octokit, repo, s, prNumber) : /* @__PURE__ */ new Map(),
+    author,
+    states: cfg.roundReviewStates,
+    trustedAssociations: cfg.trustedAssociations
+  });
+  const highFiles = tier.forced ? [...new Set(files)] : tier.triggers.map((t) => t.file);
+  const codeowners = await codeownersState(octokit, repo, cfg, tier.tier, highFiles, pr.base.sha, approvers, author);
+  const alreadyAsked = /* @__PURE__ */ new Set([
+    author.toLowerCase(),
+    ...reviews.map((r) => r.user.toLowerCase()),
+    ...(pr.requested_reviewers ?? []).map((r) => r.login.toLowerCase()),
+    ...(pr.requested_teams ?? []).map((t) => t.slug.toLowerCase())
+  ]);
+  const snapshot = cfg.requireGreenCi ? await waitForCi(octokit, repo, s, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg, s), ciWaitSeconds) : await readCi(octokit, repo, s, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg, s));
+  const ci = cfg.requireGreenCi ? snapshot : null;
+  const input = {
+    cfg,
+    author,
+    tier,
+    ...scopeNote ? { scopeNote } : {},
+    evidence,
+    ci,
+    approvers,
+    ignoredApprovals: { stale: approval.stale, untrusted: approval.untrusted },
+    codeowners,
+    rounds,
+    ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files)
+  };
+  if (input.ownerOverride) s.log.info(input.ownerOverride.applies ? `Owner override applies to @${author}.` : `Owner override not applied for @${author}: ${input.ownerOverride.reason}.`);
+  const result = decide(input);
+  const humans = [.../* @__PURE__ */ new Set([...cfg.maintainers, ...codeowners.owners.users, ...codeowners.owners.teams])].filter(
+    (h) => h.toLowerCase() !== author.toLowerCase()
+  );
+  const prInputs = toInputs(pr, reviews, { author, trustedAssociations: cfg.trustedAssociations });
+  return { pr, cfg, author, input, result, humans, reviews, alreadyAsked, inputsKey: inputsKey(prInputs), fingerprint: fingerprint(prInputs, snapshot) };
+}
+async function judgePr(octokit, repo, s, prNumber, ciWait) {
+  const { data: current } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
+  let scopeNote;
+  if (current.state === "open") {
+    const scopeCfg = await scopeConfigFor(octokit, repo, s, current);
+    const scope = inScope(scopeCfg.scope, scopePr(current));
+    if (!scope.inScope) {
+      const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
+      const forced = forcedIntoScope(scopeCfg, fileObjs, current.changed_files);
+      if (!forced) return { kind: "out-of-scope", pr: current, reason: scope.reason };
+      scopeNote = forced;
+      s.log.info(`PR #${prNumber} is in scope: ${forced}.`);
+    }
+  }
+  const stable = await evaluateUntilStable(
+    // Only the first attempt waits for CI; retries re-read it once (#14).
+    (attempt) => evaluatePr(octokit, repo, s, prNumber, ciWait(attempt), scopeNote),
+    (ev) => ev.inputsKey,
+    (ev) => currentInputsKey(octokit, repo, prNumber, { author: ev.author, trustedAssociations: ev.cfg.trustedAssociations }),
+    2
+  );
+  if (stable === null) return { kind: "not-open" };
+  if (stable.stale) return { kind: "stale", reason: stable.reason };
+  return { kind: "evaluated", ev: stable.value, attempts: stable.attempts };
+}
+
+// src/main.ts
+var LABEL_COLORS = {
+  "risk:low": "0e8a16",
+  "risk:medium": "fbca04",
+  "risk:high": "b60205",
+  "needs-human": "5319e7"
+};
 async function resolvePrNumbers(octokit, repo) {
   const input = getInput("pr-number").trim();
   if (input) {
@@ -35017,28 +35242,19 @@ async function upsertComment(octokit, repo, pr, body, listed) {
   const res = await octokit.rest.issues.createComment({ ...repo, issue_number: pr, body });
   return { id: res.data.id, created: true };
 }
-var runsBySha = /* @__PURE__ */ new Map();
-var workflowFiles = /* @__PURE__ */ new Map();
-var gateLookupWarned = false;
-function gateLookup(octokit, repo) {
+function actionSettings() {
+  const statusContext = getInput("status-context");
   return {
-    runs: (sha, refresh) => {
-      if (refresh || !runsBySha.has(sha)) {
-        const p = octokit.paginate(octokit.rest.actions.listWorkflowRunsForRepo, { ...repo, head_sha: sha, per_page: 100 }).then((runs) => runs.map((r) => ({ checkSuiteId: r.check_suite_id ?? 0, path: r.path ?? "", event: r.event, headSha: r.head_sha })));
-        runsBySha.set(sha, p);
-        p.catch(() => runsBySha.delete(sha));
-      }
-      return runsBySha.get(sha);
-    },
-    workflow: (path3, ref) => {
-      const key = `${path3}@${ref}`;
-      if (!workflowFiles.has(key)) {
-        const p = readFile(octokit, repo, path3, ref);
-        workflowFiles.set(key, p);
-        p.catch(() => workflowFiles.delete(key));
-      }
-      return workflowFiles.get(key);
-    }
+    configPath: getInput("config-path") || ".review-gate.yml",
+    configRef: getInput("config-ref"),
+    ignoreChecks: [
+      ...getInput("ignore-checks").split(",").map((s) => s.trim()).filter(Boolean),
+      ...statusContext ? [statusContext] : []
+    ],
+    job: context2.job,
+    runId: String(context2.runId),
+    usesThisAction,
+    log: { info: (m) => info(m), warning: (m) => warning(m) }
   };
 }
 function usesThisAction(ref) {
@@ -35047,93 +35263,6 @@ function usesThisAction(ref) {
   if (action && (u.startsWith(`${action}@`) || u.startsWith(`${action}/`))) return true;
   const here = `${context2.repo.owner}/${context2.repo.repo}`.toLowerCase();
   return (u === "./" || u === ".") && (!action || action === here);
-}
-async function readCi(octokit, repo, sha, defaultBranch, ignoreNames) {
-  const checks = await octokit.paginate(octokit.rest.checks.listForRef, { ...repo, ref: sha, per_page: 100, filter: "latest" });
-  const statuses = await octokit.paginate(octokit.rest.repos.listCommitStatusesForRef, { ...repo, ref: sha, per_page: 100 });
-  const lite = checks.map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion, url: c.details_url ?? c.html_url, suiteId: c.check_suite?.id ?? null }));
-  const runId = String(context2.runId);
-  const job = context2.job;
-  let suites;
-  try {
-    suites = await gateSuites(lite, { job, runId }, sha, defaultBranch, usesThisAction, gateLookup(octokit, repo));
-  } catch (e) {
-    if (!gateLookupWarned) warning(`Could not map checks to workflow runs (${e.message}); skipping every check named "${job}". Grant actions: read to fix this.`);
-    gateLookupWarned = true;
-  }
-  return evaluateCi(lite, statuses.map((s) => ({ context: s.context, state: s.state })), { names: ignoreNames, runId, job, gateSuites: suites });
-}
-async function waitForCi(octokit, repo, sha, defaultBranch, ignoreNames, waitSeconds) {
-  const deadline = Date.now() + waitSeconds * 1e3;
-  let ci = await readCi(octokit, repo, sha, defaultBranch, ignoreNames);
-  while ((ci.state === "pending" || ci.state === "none") && Date.now() < deadline) {
-    info(`CI is ${ci.state}; waiting (pending: ${ci.pending.join(", ") || "none yet"})`);
-    await new Promise((r) => setTimeout(r, 15e3));
-    ci = await readCi(octokit, repo, sha, defaultBranch, ignoreNames);
-  }
-  return ci;
-}
-async function dismissedOriginalStates(octokit, repo, pr) {
-  const out = /* @__PURE__ */ new Map();
-  try {
-    const events = await octokit.paginate(octokit.rest.issues.listEventsForTimeline, { ...repo, issue_number: pr, per_page: 100 });
-    for (const e of events) {
-      if (e.event === "review_dismissed" && e.dismissed_review?.review_id && e.dismissed_review.state) {
-        out.set(e.dismissed_review.review_id, e.dismissed_review.state);
-      }
-    }
-  } catch (err) {
-    warning(`Could not read the PR timeline: ${err.message}. Rounds are unknown; the gate blocks.`);
-    return null;
-  }
-  return out;
-}
-async function loadConfig(octokit, repo, configPath, ref) {
-  const text = await readFile(octokit, repo, configPath, ref);
-  if (text === null) {
-    warning(`${configPath} not found at ${ref}; using defaults (every file gets the default tier).`);
-    return { ...defaultConfig(configPath), missing: true };
-  }
-  return parseConfig(text, configPath);
-}
-async function codeownersState(octokit, repo, cfg, tier, highFiles, baseSha, approvers, author) {
-  const empty = { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] };
-  if (tier !== "high" || !cfg.highRequiresCodeowners) return empty;
-  let text = null;
-  for (const p of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
-    text = await readFile(octokit, repo, p, baseSha);
-    if (text !== null) break;
-  }
-  if (text === null) {
-    return { ...empty, required: true, satisfied: false, missingFile: true, note: `No CODEOWNERS file on the base branch. Add one, or set routing.high_requires_codeowners: false in ${cfg.path}.` };
-  }
-  const rules = parseCodeowners(text);
-  const owners = splitOwners([...new Set(highFiles.flatMap((f) => ownersFor(f, rules)))]);
-  const membership = /* @__PURE__ */ new Map();
-  let teamNote;
-  for (const team of owners.teams) {
-    const [org, slug] = team.split("/");
-    for (const a of approvers) {
-      let v;
-      try {
-        const m = await octokit.rest.teams.getMembershipForUserInOrg({ org, team_slug: slug, username: a });
-        v = m.data.state === "active";
-      } catch {
-        v = null;
-      }
-      if (v === null) teamNote = `Could not confirm membership of @${team} with this token (404 or no org access). Branch protection must enforce the team review.`;
-      membership.set(`${team}
-${a.toLowerCase()}`, v);
-    }
-  }
-  if (owners.teams.length && approvers.length === 0) {
-    teamNote = `Team owners (${owners.teams.map((t) => "@" + t).join(", ")}) can only be verified when this token can read org teams. Otherwise branch protection must enforce the team review.`;
-  }
-  const coverage = codeownerCoverage(highFiles, rules, approvers, author, (team, user) => membership.get(`${team}
-${user.toLowerCase()}`) ?? null);
-  const satisfied = coverage.length > 0 && coverage.every((c) => c.status === "approved");
-  const approvedBy = [...new Set(coverage.flatMap((c) => c.approvedBy))].sort();
-  return { required: true, owners, approvedBy, satisfied, coverage, requested: [], note: satisfied ? void 0 : teamNote };
 }
 async function requestReviews(octokit, repo, pr, users, teams, skip) {
   const u = users.filter((x) => !skip.has(x.toLowerCase()));
@@ -35179,28 +35308,6 @@ function revertsOnce(octokit, repo) {
   });
   return revertCache;
 }
-function baseIgnores() {
-  const statusContext = getInput("status-context");
-  return [
-    ...getInput("ignore-checks").split(",").map((s) => s.trim()).filter(Boolean),
-    ...statusContext ? [statusContext] : []
-  ];
-}
-function toInputs(pr, reviews, who) {
-  return toPrInputs({ headSha: pr.head.sha, baseSha: pr.base.sha, body: pr.body ?? null, draft: Boolean(pr.draft) }, reviews, who);
-}
-function configFor(octokit, repo, pr) {
-  const configPath = getInput("config-path") || ".review-gate.yml";
-  return loadConfig(octokit, repo, configPath, configRefs(getInput("config-ref"), pr).rules);
-}
-function scopePr(pr) {
-  const login = pr.user?.login ?? "";
-  return { author: login, isBot: isBotLogin(login, pr.user?.type), labels: (pr.labels ?? []).map((l) => typeof l === "string" ? l : l.name ?? "") };
-}
-function scopeConfigFor(octokit, repo, pr) {
-  const configPath = getInput("config-path") || ".review-gate.yml";
-  return loadConfig(octokit, repo, configPath, configRefs(getInput("config-ref"), pr).scope);
-}
 async function writeOutOfScope(octokit, repo, pr, reason) {
   const log = { warning: (m) => warning(m) };
   info(`PR #${pr.number}: ${reason}. Not checked.`);
@@ -35231,31 +35338,12 @@ async function writeOutOfScope(octokit, repo, pr, reason) {
   setOutput("missing", "[]");
   return "pass";
 }
-function ciIgnores(cfg) {
-  return [...cfg.ignoreChecks, ...baseIgnores()];
-}
-async function listReviews(octokit, repo, prNumber) {
-  const raw = await octokit.paginate(octokit.rest.pulls.listReviews, { ...repo, pull_number: prNumber, per_page: 100 });
-  return raw.map((r) => ({
-    id: r.id,
-    user: r.user?.login ?? "",
-    isBot: isBotLogin(r.user?.login ?? "", r.user?.type),
-    state: r.state,
-    submittedAt: r.submitted_at ?? null,
-    commitId: r.commit_id ?? null,
-    association: r.author_association
-  }));
-}
-async function currentInputsKey(octokit, repo, prNumber, who) {
-  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  if (pr.state !== "open") return null;
-  return inputsKey(toInputs(pr, await listReviews(octokit, repo, prNumber), who));
-}
 async function currentFingerprint(octokit, repo, prNumber) {
   const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  const cfg = await configFor(octokit, repo, pr);
+  const s = actionSettings();
+  const cfg = await configFor(octokit, repo, s, pr);
   const reviews = await listReviews(octokit, repo, prNumber);
-  const ci = await readCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg));
+  const ci = await readCi(octokit, repo, s, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg, s));
   return fingerprint(toInputs(pr, reviews, { author: pr.user?.login ?? "", trustedAssociations: cfg.trustedAssociations }), ci);
 }
 async function storedState(octokit, repo, prNumber, identity) {
@@ -35276,7 +35364,8 @@ async function planOpenSweep(octokit, repo) {
   if (rawMaxPrs.trim() && String(maxPrs) !== rawMaxPrs.trim()) warning(`max-prs "${rawMaxPrs}" is not a positive integer; using 20.`);
   const maxAgeMs = Number(getInput("recheck-max-age-hours") || "6") * 36e5;
   const listed = await octokit.paginate(octokit.rest.pulls.list, { ...repo, state: "open", per_page: 100 });
-  const scopeByBase = onceByKey((sha) => scopeConfigFor(octokit, repo, { base: { sha }, head: { sha } }));
+  const settings = actionSettings();
+  const scopeByBase = onceByKey((sha) => scopeConfigFor(octokit, repo, settings, { base: { sha }, head: { sha } }));
   const outOfScope = /* @__PURE__ */ new Set();
   for (const pr of listed) {
     try {
@@ -35323,61 +35412,6 @@ async function planOpenSweep(octokit, repo) {
     `Sweep: ${open2.length} open PR(s); running ${plan.run.length} (${plan.run.join(", ") || "none"}), skipping ${plan.skipped.length} unchanged, deferring ${plan.deferred.length}, failed ${plan.failed.length}` + (plan.stoppedEarly ? `, stopped early: ${plan.stoppedEarly}` : "") + "."
   );
   return plan.run;
-}
-async function evaluatePr(octokit, repo, prNumber, ciWaitSeconds, scopeNote) {
-  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  if (pr.state !== "open") return null;
-  const author = pr.user?.login ?? "";
-  const cfg = scopeNote ? await scopeConfigFor(octokit, repo, pr) : await configFor(octokit, repo, pr);
-  const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
-  const files = fileObjs.flatMap((f) => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
-  const tier = classify(files, cfg, { total: pr.changed_files, seen: fileObjs.length });
-  info(`Tier: ${tier.tier} (${tier.triggers.map((t) => t.file).join(", ") || "default"})`);
-  const evidence = checkEvidence(pr.body, cfg.sections);
-  const reviews = await listReviews(octokit, repo, prNumber);
-  const approval = approvalsFor(reviews, author, {
-    headSha: pr.head.sha,
-    allowStale: cfg.allowStaleApprovals,
-    trustedAssociations: cfg.trustedAssociations
-  });
-  const approvers = approval.approvers;
-  const rounds = countRounds(reviews, {
-    headSha: pr.head.sha,
-    dismissedOriginal: reviews.some((r) => r.state === "DISMISSED") ? await dismissedOriginalStates(octokit, repo, prNumber) : /* @__PURE__ */ new Map(),
-    author,
-    states: cfg.roundReviewStates,
-    trustedAssociations: cfg.trustedAssociations
-  });
-  const highFiles = tier.forced ? [...new Set(files)] : tier.triggers.map((t) => t.file);
-  const codeowners = await codeownersState(octokit, repo, cfg, tier.tier, highFiles, pr.base.sha, approvers, author);
-  const alreadyAsked = /* @__PURE__ */ new Set([
-    author.toLowerCase(),
-    ...reviews.map((r) => r.user.toLowerCase()),
-    ...(pr.requested_reviewers ?? []).map((r) => r.login.toLowerCase()),
-    ...(pr.requested_teams ?? []).map((t) => t.slug.toLowerCase())
-  ]);
-  const snapshot = cfg.requireGreenCi ? await waitForCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg), ciWaitSeconds) : await readCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg));
-  const ci = cfg.requireGreenCi ? snapshot : null;
-  const input = {
-    cfg,
-    author,
-    tier,
-    ...scopeNote ? { scopeNote } : {},
-    evidence,
-    ci,
-    approvers,
-    ignoredApprovals: { stale: approval.stale, untrusted: approval.untrusted },
-    codeowners,
-    rounds,
-    ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files)
-  };
-  if (input.ownerOverride) info(input.ownerOverride.applies ? `Owner override applies to @${author}.` : `Owner override not applied for @${author}: ${input.ownerOverride.reason}.`);
-  const result = decide(input);
-  const humans = [.../* @__PURE__ */ new Set([...cfg.maintainers, ...codeowners.owners.users, ...codeowners.owners.teams])].filter(
-    (h) => h.toLowerCase() !== author.toLowerCase()
-  );
-  const prInputs = toInputs(pr, reviews, { author, trustedAssociations: cfg.trustedAssociations });
-  return { pr, cfg, author, input, result, humans, reviews, alreadyAsked, inputsKey: inputsKey(prInputs), fingerprint: fingerprint(prInputs, snapshot) };
 }
 async function writeEvaluation(octokit, repo, ev) {
   const { pr, cfg, author, input, result, humans, reviews, alreadyAsked } = ev;
@@ -35468,38 +35502,22 @@ ${cfg.revertLookbackDays}`);
   return result.pass ? "pass" : "blocked";
 }
 async function runForPr(octokit, repo, prNumber) {
-  const { data: current } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  let scopeNote;
-  if (current.state === "open") {
-    const scopeCfg = await scopeConfigFor(octokit, repo, current);
-    const scope = inScope(scopeCfg.scope, scopePr(current));
-    if (!scope.inScope) {
-      const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
-      const forced = forcedIntoScope(scopeCfg, fileObjs, current.changed_files);
-      if (!forced) return writeOutOfScope(octokit, repo, current, scope.reason);
-      scopeNote = forced;
-      info(`PR #${prNumber} is in scope: ${forced}.`);
-    }
-  }
   const wait = ciWaitFor(Number(getInput("ci-wait-seconds") || "0"));
-  const stable = await evaluateUntilStable(
-    // Only the first attempt waits for CI; retries re-read it once (#14).
-    (attempt) => evaluatePr(octokit, repo, prNumber, wait(attempt), scopeNote),
-    (ev) => ev.inputsKey,
-    (ev) => currentInputsKey(octokit, repo, prNumber, { author: ev.author, trustedAssociations: ev.cfg.trustedAssociations }),
-    2
-  );
-  if (stable === null) {
-    info(`PR #${prNumber} is not open; nothing to gate.`);
-    return "stale";
+  const judged = await judgePr(octokit, repo, actionSettings(), prNumber, wait);
+  switch (judged.kind) {
+    case "out-of-scope":
+      return writeOutOfScope(octokit, repo, judged.pr, judged.reason);
+    case "not-open":
+      info(`PR #${prNumber} is not open; nothing to gate.`);
+      return "stale";
+    case "stale":
+      notice(`Stale run for PR #${prNumber}: ${judged.reason}. Nothing written; the next event or scheduled re-check will report.`);
+      setOutput("result", "stale");
+      return "stale";
+    case "evaluated":
+      if (judged.attempts > 1) info(`PR #${prNumber} inputs settled after ${judged.attempts} evaluations.`);
+      return writeEvaluation(octokit, repo, judged.ev);
   }
-  if (stable.stale) {
-    notice(`Stale run for PR #${prNumber}: ${stable.reason}. Nothing written; the next event or scheduled re-check will report.`);
-    setOutput("result", "stale");
-    return "stale";
-  }
-  if (stable.attempts > 1) info(`PR #${prNumber} inputs settled after ${stable.attempts} evaluations.`);
-  return writeEvaluation(octokit, repo, stable.value);
 }
 async function run() {
   try {

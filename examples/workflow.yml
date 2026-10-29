@@ -36,7 +36,7 @@ jobs:
       - id: gate
         # Pin a full 40-character commit SHA and keep the version comment. Never use a branch
         # name like @main: whoever can push to it controls your gate.
-        uses: 0xgui/agent-pr-gate@b8f3228e83e7ae46fb2b74bbfe22d09de8b6c39a # v1.0.2
+        uses: 0xgui/agent-pr-gate@2da570e75f377b413e19bdfc338dab7c9e881538 # v1.0.3
         with:
           # Wait about as long as CI takes, so the first status isn't "CI pending".
           # workflow_run re-runs the gate when CI finishes either way.

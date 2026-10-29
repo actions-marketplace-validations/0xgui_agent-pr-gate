@@ -1,11 +1,14 @@
 {
   "name": "agent-pr-gate",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "GitHub Action that gates agent-written PRs before human review: risk tiers, required evidence, reviewer routing.",
   "main": "dist/index.js",
+  "bin": {
+    "agent-pr-gate": "dist/cli.js"
+  },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --legal-comments=none --outfile=dist/index.js",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --legal-comments=none --outfile=dist/index.js && esbuild src/bin.ts --bundle --platform=node --target=node24 --format=cjs --legal-comments=none --banner:js='#!/usr/bin/env node' --outfile=dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",

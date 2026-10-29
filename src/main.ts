@@ -2,24 +2,30 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { configRefs, defaultConfig, GateConfig, parseConfig, Tier, TIERS } from './config';
-import { forcedIntoScope, inScope, renderOutOfScope, ScopePr } from './scope';
-import { classify } from './tiers';
-import { checkEvidence } from './evidence';
-import { evaluateCi, CiResult, gateSuites, GateLookup, WorkflowRunLite } from './ci';
-import { codeownerCoverage, parseCodeowners, ownersFor, splitOwners } from './codeowners';
-import { approvalsFor, countRounds, isBotLogin, ReviewLite, timeToFirstHumanReview } from './reviews';
-import { CodeownersState, decide, GateInput, ownerOverrideFor, pickGateComments, renderComment } from './gate';
+import { Tier, TIERS } from './config';
+import { inScope, renderOutOfScope } from './scope';
+import { timeToFirstHumanReview } from './reviews';
+import { pickGateComments, renderComment } from './gate';
 import { isRevertTitle, Metrics, metricsMarkdown } from './metrics';
-import { ciWaitFor, evaluateUntilStable, Outcome, stateAfterStatus, statusState, statusWriteNeeded, stepShouldFail, tryWrite } from './writes';
-import { fingerprint, GateState, inputsKey, parseState, PrInputs, toPrInputs } from './state';
+import { ciWaitFor, Outcome, stateAfterStatus, statusState, statusWriteNeeded, stepShouldFail, tryWrite } from './writes';
+import { fingerprint, GateState, parseState } from './state';
 import { onceByKey, positiveInt, sweepReserve, planSweep, rateLimitLow, runEach, SweepCandidate } from './sweep';
-
-type Octokit = ReturnType<typeof github.getOctokit>;
-interface Repo {
-  owner: string;
-  repo: string;
-}
+import {
+  ciIgnores,
+  configFor,
+  Evaluation,
+  isNotFound,
+  judgePr,
+  listReviews,
+  Octokit,
+  readCi,
+  Repo,
+  scopeConfigFor,
+  scopePr,
+  ScopeLike,
+  Settings,
+  toInputs,
+} from './evaluate';
 
 const LABEL_COLORS: Record<string, string> = {
   'risk:low': '0e8a16',
@@ -27,22 +33,6 @@ const LABEL_COLORS: Record<string, string> = {
   'risk:high': 'b60205',
   'needs-human': '5319e7',
 };
-
-function isNotFound(e: unknown): boolean {
-  return typeof e === 'object' && e !== null && (e as { status?: number }).status === 404;
-}
-
-async function readFile(octokit: Octokit, repo: Repo, filePath: string, ref: string): Promise<string | null> {
-  try {
-    const res = await octokit.rest.repos.getContent({ ...repo, path: filePath, ref });
-    const data = res.data as { type?: string; content?: string; encoding?: string };
-    if (data.type !== 'file' || typeof data.content !== 'string') return null;
-    return Buffer.from(data.content, (data.encoding as BufferEncoding) || 'base64').toString('utf8');
-  } catch (e) {
-    if (isNotFound(e)) return null;
-    throw e;
-  }
-}
 
 async function resolvePrNumbers(octokit: Octokit, repo: Repo): Promise<number[]> {
   const input = core.getInput('pr-number').trim();
@@ -138,32 +128,24 @@ async function upsertComment(octokit: Octokit, repo: Repo, pr: number, body: str
   return { id: res.data.id, created: true };
 }
 
-/** Per-process caches for finding the gate's own checks (#2): runs per head SHA, files per path and ref. */
-const runsBySha = new Map<string, Promise<WorkflowRunLite[]>>();
-const workflowFiles = new Map<string, Promise<string | null>>();
-let gateLookupWarned = false;
-
-function gateLookup(octokit: Octokit, repo: Repo): GateLookup {
+/**
+ * The action's inputs and workflow context as evaluation settings. Read at call time, per PR.
+ * ignoreChecks holds the check names and status contexts that are the gate itself; the job's own
+ * checks are found by workflow in readCi (#2).
+ */
+function actionSettings(): Settings {
+  const statusContext = core.getInput('status-context');
   return {
-    runs: (sha, refresh) => {
-      if (refresh || !runsBySha.has(sha)) {
-        const p = octokit
-          .paginate(octokit.rest.actions.listWorkflowRunsForRepo, { ...repo, head_sha: sha, per_page: 100 })
-          .then((runs) => runs.map((r) => ({ checkSuiteId: r.check_suite_id ?? 0, path: r.path ?? '', event: r.event, headSha: r.head_sha })));
-        runsBySha.set(sha, p);
-        p.catch(() => runsBySha.delete(sha));
-      }
-      return runsBySha.get(sha)!;
-    },
-    workflow: (path, ref) => {
-      const key = `${path}@${ref}`;
-      if (!workflowFiles.has(key)) {
-        const p = readFile(octokit, repo, path, ref);
-        workflowFiles.set(key, p);
-        p.catch(() => workflowFiles.delete(key));
-      }
-      return workflowFiles.get(key)!;
-    },
+    configPath: core.getInput('config-path') || '.review-gate.yml',
+    configRef: core.getInput('config-ref'),
+    ignoreChecks: [
+      ...core.getInput('ignore-checks').split(',').map((s) => s.trim()).filter(Boolean),
+      ...(statusContext ? [statusContext] : []),
+    ],
+    job: github.context.job,
+    runId: String(github.context.runId),
+    usesThisAction,
+    log: { info: (m) => core.info(m), warning: (m) => core.warning(m) },
   };
 }
 
@@ -174,114 +156,6 @@ function usesThisAction(ref: string): boolean {
   if (action && (u.startsWith(`${action}@`) || u.startsWith(`${action}/`))) return true;
   const here = `${github.context.repo.owner}/${github.context.repo.repo}`.toLowerCase();
   return (u === './' || u === '.') && (!action || action === here);
-}
-
-async function readCi(octokit: Octokit, repo: Repo, sha: string, defaultBranch: string, ignoreNames: string[]): Promise<CiResult> {
-  const checks = await octokit.paginate(octokit.rest.checks.listForRef, { ...repo, ref: sha, per_page: 100, filter: 'latest' });
-  const statuses = await octokit.paginate(octokit.rest.repos.listCommitStatusesForRef, { ...repo, ref: sha, per_page: 100 });
-  const lite = checks.map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion, url: c.details_url ?? c.html_url, suiteId: c.check_suite?.id ?? null }));
-  const runId = String(github.context.runId);
-  const job = github.context.job;
-  let suites: number[] | undefined;
-  try {
-    suites = await gateSuites(lite, { job, runId }, sha, defaultBranch, usesThisAction, gateLookup(octokit, repo));
-  } catch (e) {
-    // Without actions: read the workflow runs can't be read; fall back to skipping by job name.
-    if (!gateLookupWarned) core.warning(`Could not map checks to workflow runs (${(e as Error).message}); skipping every check named "${job}". Grant actions: read to fix this.`);
-    gateLookupWarned = true;
-  }
-  return evaluateCi(lite, statuses.map((s) => ({ context: s.context, state: s.state })), { names: ignoreNames, runId, job, gateSuites: suites });
-}
-
-async function waitForCi(octokit: Octokit, repo: Repo, sha: string, defaultBranch: string, ignoreNames: string[], waitSeconds: number): Promise<CiResult> {
-  const deadline = Date.now() + waitSeconds * 1000;
-  let ci = await readCi(octokit, repo, sha, defaultBranch, ignoreNames);
-  while ((ci.state === 'pending' || ci.state === 'none') && Date.now() < deadline) {
-    core.info(`CI is ${ci.state}; waiting (pending: ${ci.pending.join(', ') || 'none yet'})`);
-    await new Promise((r) => setTimeout(r, 15000));
-    ci = await readCi(octokit, repo, sha, defaultBranch, ignoreNames);
-  }
-  return ci;
-}
-
-/**
- * Original state of each dismissed review, from the timeline's review_dismissed events.
- * The reviews API only reports DISMISSED; dismissed_review.state keeps what it was.
- */
-async function dismissedOriginalStates(octokit: Octokit, repo: Repo, pr: number): Promise<Map<number, string> | null> {
-  const out = new Map<number, string>();
-  try {
-    const events = await octokit.paginate(octokit.rest.issues.listEventsForTimeline, { ...repo, issue_number: pr, per_page: 100 });
-    for (const e of events as { event?: string; dismissed_review?: { review_id?: number; state?: string } }[]) {
-      if (e.event === 'review_dismissed' && e.dismissed_review?.review_id && e.dismissed_review.state) {
-        out.set(e.dismissed_review.review_id, e.dismissed_review.state);
-      }
-    }
-  } catch (err) {
-    // Fail closed (#16): countRounds reports rounds as unknown and the gate blocks.
-    core.warning(`Could not read the PR timeline: ${(err as Error).message}. Rounds are unknown; the gate blocks.`);
-    return null;
-  }
-  return out;
-}
-
-async function loadConfig(octokit: Octokit, repo: Repo, configPath: string, ref: string): Promise<GateConfig> {
-  const text = await readFile(octokit, repo, configPath, ref);
-  if (text === null) {
-    core.warning(`${configPath} not found at ${ref}; using defaults (every file gets the default tier).`);
-    return { ...defaultConfig(configPath), missing: true };
-  }
-  return parseConfig(text, configPath);
-}
-
-async function codeownersState(
-  octokit: Octokit,
-  repo: Repo,
-  cfg: GateConfig,
-  tier: Tier,
-  highFiles: string[],
-  baseSha: string,
-  approvers: string[],
-  author: string,
-): Promise<CodeownersState> {
-  const empty: CodeownersState = { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] };
-  if (tier !== 'high' || !cfg.highRequiresCodeowners) return empty;
-  let text: string | null = null;
-  for (const p of ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']) {
-    text = await readFile(octokit, repo, p, baseSha);
-    if (text !== null) break;
-  }
-  if (text === null) {
-    return { ...empty, required: true, satisfied: false, missingFile: true, note: `No CODEOWNERS file on the base branch. Add one, or set routing.high_requires_codeowners: false in ${cfg.path}.` };
-  }
-  const rules = parseCodeowners(text);
-  const owners = splitOwners([...new Set(highFiles.flatMap((f) => ownersFor(f, rules)))]);
-
-  // Resolve team membership for each approver up front. A 404 can mean "not a member" or
-  // "this token cannot see the team", so it is reported as unknown, never as a silent no.
-  const membership = new Map<string, boolean | null>();
-  let teamNote: string | undefined;
-  for (const team of owners.teams) {
-    const [org, slug] = team.split('/');
-    for (const a of approvers) {
-      let v: boolean | null;
-      try {
-        const m = await octokit.rest.teams.getMembershipForUserInOrg({ org: org!, team_slug: slug!, username: a });
-        v = m.data.state === 'active';
-      } catch {
-        v = null;
-      }
-      if (v === null) teamNote = `Could not confirm membership of @${team} with this token (404 or no org access). Branch protection must enforce the team review.`;
-      membership.set(`${team}\n${a.toLowerCase()}`, v);
-    }
-  }
-  if (owners.teams.length && approvers.length === 0) {
-    teamNote = `Team owners (${owners.teams.map((t) => '@' + t).join(', ')}) can only be verified when this token can read org teams. Otherwise branch protection must enforce the team review.`;
-  }
-  const coverage = codeownerCoverage(highFiles, rules, approvers, author, (team, user) => membership.get(`${team}\n${user.toLowerCase()}`) ?? null);
-  const satisfied = coverage.length > 0 && coverage.every((c) => c.status === 'approved');
-  const approvedBy = [...new Set(coverage.flatMap((c) => c.approvedBy))].sort();
-  return { required: true, owners, approvedBy, satisfied, coverage, requested: [], note: satisfied ? undefined : teamNote };
 }
 
 async function requestReviews(
@@ -343,50 +217,6 @@ function revertsOnce(octokit: Octokit, repo: Repo): (key: string) => Promise<Met
   return revertCache;
 }
 
-/** Check names and status contexts that are the gate itself, never part of the CI verdict. The job's own checks are found by workflow in readCi (#2). */
-function baseIgnores(): string[] {
-  const statusContext = core.getInput('status-context');
-  return [
-    ...core.getInput('ignore-checks').split(',').map((s) => s.trim()).filter(Boolean),
-    ...(statusContext ? [statusContext] : []),
-  ];
-}
-
-interface PrLike {
-  head: { sha: string };
-  base: { sha: string };
-  body?: string | null;
-  draft?: boolean;
-}
-
-type Who = { author: string; trustedAssociations: string[] };
-
-function toInputs(pr: PrLike, reviews: ReviewLite[], who: Who): PrInputs {
-  return toPrInputs({ headSha: pr.head.sha, baseSha: pr.base.sha, body: pr.body ?? null, draft: Boolean(pr.draft) }, reviews, who);
-}
-
-/** The repo config that applies to a PR (base by default, head with config-ref: head). */
-function configFor(octokit: Octokit, repo: Repo, pr: PrLike): Promise<GateConfig> {
-  const configPath = core.getInput('config-path') || '.review-gate.yml';
-  return loadConfig(octokit, repo, configPath, configRefs(core.getInput('config-ref'), pr).rules);
-}
-
-interface ScopeLike extends PrLike {
-  user?: { login?: string; type?: string } | null;
-  labels?: ({ name?: string } | string)[];
-}
-
-function scopePr(pr: ScopeLike): ScopePr {
-  const login = pr.user?.login ?? '';
-  return { author: login, isBot: isBotLogin(login, pr.user?.type), labels: (pr.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))) };
-}
-
-/** Scope always comes from the base commit's config, so a PR cannot take itself out of scope. */
-function scopeConfigFor(octokit: Octokit, repo: Repo, pr: PrLike): Promise<GateConfig> {
-  const configPath = core.getInput('config-path') || '.review-gate.yml';
-  return loadConfig(octokit, repo, configPath, configRefs(core.getInput('config-ref'), pr).scope);
-}
-
 /**
  * An out-of-scope PR gets a passing status, so required-status setups do not wait forever. The
  * gate creates no comment, so PRs it does not own get no noise. If an earlier run left a gate
@@ -423,37 +253,13 @@ async function writeOutOfScope(octokit: Octokit, repo: Repo, pr: ScopeLike & { n
   return 'pass';
 }
 
-/** One ignore list for the CI verdict and the fingerprint, so both describe the same CI (#11). */
-function ciIgnores(cfg: GateConfig): string[] {
-  return [...cfg.ignoreChecks, ...baseIgnores()];
-}
-
-async function listReviews(octokit: Octokit, repo: Repo, prNumber: number): Promise<ReviewLite[]> {
-  const raw = await octokit.paginate(octokit.rest.pulls.listReviews, { ...repo, pull_number: prNumber, per_page: 100 });
-  return raw.map((r) => ({
-    id: r.id,
-    user: r.user?.login ?? '',
-    isBot: isBotLogin(r.user?.login ?? '', r.user?.type),
-    state: r.state,
-    submittedAt: r.submitted_at ?? null,
-    commitId: r.commit_id ?? null,
-    association: r.author_association,
-  }));
-}
-
-/** Current inputs key of an open PR, or null when it is no longer open. */
-async function currentInputsKey(octokit: Octokit, repo: Repo, prNumber: number, who: Who): Promise<string | null> {
-  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  if (pr.state !== 'open') return null;
-  return inputsKey(toInputs(pr, await listReviews(octokit, repo, prNumber), who));
-}
-
 /** Fingerprint of a PR's inputs plus its CI, computed exactly as evaluatePr stores it (#11). */
 async function currentFingerprint(octokit: Octokit, repo: Repo, prNumber: number): Promise<string> {
   const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  const cfg = await configFor(octokit, repo, pr);
+  const s = actionSettings();
+  const cfg = await configFor(octokit, repo, s, pr);
   const reviews = await listReviews(octokit, repo, prNumber);
-  const ci = await readCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg));
+  const ci = await readCi(octokit, repo, s, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg, s));
   return fingerprint(toInputs(pr, reviews, { author: pr.user?.login ?? '', trustedAssociations: cfg.trustedAssociations }), ci);
 }
 
@@ -488,7 +294,8 @@ async function planOpenSweep(octokit: Octokit, repo: Repo): Promise<number[]> {
   // them into scope, and they keep being re-checked. Skipping writes nothing. Only runForPr posts
   // the out-of-scope pass, and it checks for those changes first.
   // One config read per base commit. If it fails, keep the PR (fail safe: check it).
-  const scopeByBase = onceByKey((sha: string) => scopeConfigFor(octokit, repo, { base: { sha }, head: { sha } }));
+  const settings = actionSettings();
+  const scopeByBase = onceByKey((sha: string) => scopeConfigFor(octokit, repo, settings, { base: { sha }, head: { sha } }));
   const outOfScope = new Set<number>();
   for (const pr of listed) {
     try {
@@ -542,88 +349,6 @@ async function planOpenSweep(octokit: Octokit, repo: Repo): Promise<number[]> {
       '.',
   );
   return plan.run;
-}
-
-interface Evaluation {
-  pr: Awaited<ReturnType<Octokit['rest']['pulls']['get']>>['data'];
-  cfg: GateConfig;
-  author: string;
-  input: GateInput;
-  result: ReturnType<typeof decide>;
-  humans: string[];
-  reviews: ReviewLite[];
-  alreadyAsked: Set<string>;
-  inputsKey: string;
-  fingerprint: string;
-}
-
-/** Read everything and decide. No writes. Returns null when the PR is not open. */
-async function evaluatePr(octokit: Octokit, repo: Repo, prNumber: number, ciWaitSeconds: number, scopeNote?: string): Promise<Evaluation | null> {
-  const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  if (pr.state !== 'open') return null;
-  const author = pr.user?.login ?? '';
-  // A PR forced into scope could otherwise relax its own rules with config-ref: head (#39).
-  const cfg = scopeNote ? await scopeConfigFor(octokit, repo, pr) : await configFor(octokit, repo, pr);
-
-  const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
-  const files = fileObjs.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
-  // The files API stops at 3000 entries. Unseen files could be high risk.
-  const tier = classify(files, cfg, { total: pr.changed_files, seen: fileObjs.length });
-  core.info(`Tier: ${tier.tier} (${tier.triggers.map((t) => t.file).join(', ') || 'default'})`);
-
-  const evidence = checkEvidence(pr.body, cfg.sections);
-  const reviews = await listReviews(octokit, repo, prNumber);
-  const approval = approvalsFor(reviews, author, {
-    headSha: pr.head.sha,
-    allowStale: cfg.allowStaleApprovals,
-    trustedAssociations: cfg.trustedAssociations,
-  });
-  const approvers = approval.approvers;
-  const rounds = countRounds(reviews, {
-    headSha: pr.head.sha,
-    dismissedOriginal: reviews.some((r) => r.state === 'DISMISSED') ? await dismissedOriginalStates(octokit, repo, prNumber) : new Map(),
-    author,
-    states: cfg.roundReviewStates,
-    trustedAssociations: cfg.trustedAssociations,
-  });
-
-  // Code owners are required per high-tier file. If the tier was forced (file list truncated),
-  // every listed file needs its owner.
-  const highFiles = tier.forced ? [...new Set(files)] : tier.triggers.map((t) => t.file);
-  const codeowners = await codeownersState(octokit, repo, cfg, tier.tier, highFiles, pr.base.sha, approvers, author);
-  const alreadyAsked = new Set<string>([
-    author.toLowerCase(),
-    ...reviews.map((r) => r.user.toLowerCase()),
-    ...(pr.requested_reviewers ?? []).map((r) => r.login.toLowerCase()),
-    ...(pr.requested_teams ?? []).map((t) => t.slug.toLowerCase()),
-  ]);
-
-  // One CI snapshot for the verdict and the fingerprint (#11).
-  const snapshot = cfg.requireGreenCi
-    ? await waitForCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg), ciWaitSeconds)
-    : await readCi(octokit, repo, pr.head.sha, pr.base.repo.default_branch, ciIgnores(cfg));
-  const ci: CiResult | null = cfg.requireGreenCi ? snapshot : null;
-
-  const input: GateInput = {
-    cfg,
-    author,
-    tier,
-    ...(scopeNote ? { scopeNote } : {}),
-    evidence,
-    ci,
-    approvers,
-    ignoredApprovals: { stale: approval.stale, untrusted: approval.untrusted },
-    codeowners,
-    rounds,
-    ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files),
-  };
-  if (input.ownerOverride) core.info(input.ownerOverride.applies ? `Owner override applies to @${author}.` : `Owner override not applied for @${author}: ${input.ownerOverride.reason}.`);
-  const result = decide(input);
-  const humans = [...new Set([...cfg.maintainers, ...codeowners.owners.users, ...codeowners.owners.teams])].filter(
-    (h) => h.toLowerCase() !== author.toLowerCase(),
-  );
-  const prInputs = toInputs(pr, reviews, { author, trustedAssociations: cfg.trustedAssociations });
-  return { pr, cfg, author, input, result, humans, reviews, alreadyAsked, inputsKey: inputsKey(prInputs), fingerprint: fingerprint(prInputs, snapshot) };
 }
 
 /** Write the verdict: labels, review requests, the comment (with stored state) and the status. */
@@ -733,41 +458,23 @@ async function writeEvaluation(octokit: Octokit, repo: Repo, ev: Evaluation): Pr
 }
 
 export async function runForPr(octokit: Octokit, repo: Repo, prNumber: number): Promise<Outcome> {
-  const { data: current } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
-  let scopeNote: string | undefined;
-  if (current.state === 'open') {
-    const scopeCfg = await scopeConfigFor(octokit, repo, current);
-    const scope = inScope(scopeCfg.scope, scopePr(current));
-    if (!scope.inScope) {
-      // Scope never skips high-tier or gate-control changes. Judge them with the base config,
-      // which the PR cannot change, and gate the PR in full when either applies.
-      const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
-      const forced = forcedIntoScope(scopeCfg, fileObjs, current.changed_files);
-      if (!forced) return writeOutOfScope(octokit, repo, current, scope.reason);
-      scopeNote = forced;
-      core.info(`PR #${prNumber} is in scope: ${forced}.`);
-    }
-  }
   const wait = ciWaitFor(Number(core.getInput('ci-wait-seconds') || '0'));
-  const stable = await evaluateUntilStable(
-    // Only the first attempt waits for CI; retries re-read it once (#14).
-    (attempt) => evaluatePr(octokit, repo, prNumber, wait(attempt), scopeNote),
-    (ev) => ev.inputsKey,
-    (ev) => currentInputsKey(octokit, repo, prNumber, { author: ev.author, trustedAssociations: ev.cfg.trustedAssociations }),
-    2,
-  );
-  if (stable === null) {
-    core.info(`PR #${prNumber} is not open; nothing to gate.`);
-    return 'stale';
+  const judged = await judgePr(octokit, repo, actionSettings(), prNumber, wait);
+  switch (judged.kind) {
+    case 'out-of-scope':
+      return writeOutOfScope(octokit, repo, judged.pr, judged.reason);
+    case 'not-open':
+      core.info(`PR #${prNumber} is not open; nothing to gate.`);
+      return 'stale';
+    case 'stale':
+      // Neutral: no label, comment or commit status, and the step does not fail or claim a pass.
+      core.notice(`Stale run for PR #${prNumber}: ${judged.reason}. Nothing written; the next event or scheduled re-check will report.`);
+      core.setOutput('result', 'stale');
+      return 'stale';
+    case 'evaluated':
+      if (judged.attempts > 1) core.info(`PR #${prNumber} inputs settled after ${judged.attempts} evaluations.`);
+      return writeEvaluation(octokit, repo, judged.ev);
   }
-  if (stable.stale) {
-    // Neutral: no label, comment or commit status, and the step does not fail or claim a pass.
-    core.notice(`Stale run for PR #${prNumber}: ${stable.reason}. Nothing written; the next event or scheduled re-check will report.`);
-    core.setOutput('result', 'stale');
-    return 'stale';
-  }
-  if (stable.attempts > 1) core.info(`PR #${prNumber} inputs settled after ${stable.attempts} evaluations.`);
-  return writeEvaluation(octokit, repo, stable.value);
 }
 
 export async function run(): Promise<void> {

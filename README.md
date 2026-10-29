@@ -47,12 +47,12 @@ You need a repository with a CI workflow and permission to edit branch protectio
 	  agent-pr-gate-job:
 	    runs-on: ubuntu-latest
 	    steps:
-	      - uses: 0xgui/agent-pr-gate@b8f3228e83e7ae46fb2b74bbfe22d09de8b6c39a # v1.0.2
+	      - uses: 0xgui/agent-pr-gate@2da570e75f377b413e19bdfc338dab7c9e881538 # v1.0.3
 	        with:
 	          ci-wait-seconds: '300'   # about as long as your CI usually takes
 	```
 
-	Pin the action to a full 40-character commit SHA and keep the version in a comment. The example pins `v1.0.2`. The tag `v1` points to the latest `v1.x.y` release. `@v1` is easier to keep current, but whoever can move that tag controls your gate, so a SHA is safer. Don't use a branch name such as `@main`.
+	Pin the action to a full 40-character commit SHA and keep the version in a comment. The example pins `v1.0.3`. The tag `v1` points to the latest `v1.x.y` release. `@v1` is easier to keep current, but whoever can move that tag controls your gate, so a SHA is safer. Don't use a branch name such as `@main`.
 
 2. Merge the workflow into the default branch. Then open a PR. The gate posts its comment and sets the `agent-pr-gate` commit status.
 3. In branch protection, make the `agent-pr-gate` commit status a required check. Keep required reviews and code owner review turned on. The gate reports and routes. Branch protection is what enforces reviews.
@@ -378,6 +378,20 @@ The gate doesn't detect a force-push back to the reviewed commit with no review 
 With `pr-number: open`, the gate checks open PRs as a backstop for missed events. The gate comment holds hidden state: when the gate last checked the PR, and a fingerprint of its inputs and CI verdict. A sweep checks a PR only when the gate never saw it, its fingerprint changed, its last check is older than `recheck-max-age-hours`, or the last check couldn't finish: the commit status write was refused, or review rounds couldn't be counted. It visits the oldest-checked PRs first and stops at `max-prs` due PRs. It also stops when the remaining API budget gets close to `min-rate-limit`, and it keeps budget for the checks it already planned. That budget is an estimate, scaled by the most comment pages a PR has needed so far.
 
 The gate reads the state only from comments that its own identity wrote. Every workflow in a repository shares the default identity, `github-actions[bot]`. If other workflows post comments, run the gate with a GitHub App token and set `comment-author` to that app's bot login (for example `my-app[bot]`). Setting `comment-author` alone does not help with the default token, because the gate still posts as `github-actions[bot]`.
+
+### Check a PR without a workflow
+
+Where nothing reads the commit status (no branch protection, for example a private repo on GitHub Free), a merge script can ask for the verdict once, at merge time, instead of keeping the status fresh with re-runs:
+
+```sh
+GH_TOKEN=... npx github:0xgui/agent-pr-gate#<sha> check 41 --repo owner/repo
+```
+
+`check` reads what the action reads, from the same base commit, and decides the same way. It writes nothing: no comment, label, review request, or status. It prints the verdict as JSON on stdout (`result`, `tier`, `required_approvals`, `approvals`, `rounds`, `round_cap_reached`, `missing`, and each problem in full) and logs on stderr. It exits 0 when the PR passes or is not in scope, 1 when it is blocked, and 2 when it could not judge: an error, a PR that is not open, or a PR that changed while it read.
+
+The flags mirror the inputs that affect the verdict: `--config-path`, `--config-ref`, `--ci-wait-seconds`, `--ignore-checks`, and `--status-context`. `--gate-job` (default `agent-pr-gate-job`) and `--action` (default `0xgui/agent-pr-gate`) find the gate's own job checks, so they stay out of the CI verdict as in the action. The token comes from `GH_TOKEN` or `GITHUB_TOKEN`, the repository from `--repo` or the `origin` remote. Run `check --help` for the full list.
+
+The verdict is only as trustworthy as the machine that runs it. Use it where a local script already decides the merge, never in place of branch protection.
 
 ### Metrics
 
