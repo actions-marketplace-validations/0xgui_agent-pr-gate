@@ -25,7 +25,7 @@ jobs:
   agent-pr-gate-job:
     runs-on: ubuntu-latest
     steps:
-      - uses: 0xgui/agent-pr-gate@2da570e75f377b413e19bdfc338dab7c9e881538 # v1.0.3
+      - uses: 0xgui/agent-pr-gate@aa883cd420612fd1aa57621a17148f4357c20ccd # v1.0.4
         with:
           pr-number: open      # sweep open PRs (unchanged ones are skipped)
           max-prs: 20          # per run, oldest-checked first

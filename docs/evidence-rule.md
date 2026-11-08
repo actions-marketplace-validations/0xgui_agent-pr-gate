@@ -36,12 +36,13 @@ This rule decides whether a line of a PR description says something or is an unf
 The placeholder first-word test applies to the line and, through the recursion, to the text after a label. A placeholder word at the start of a longer label (`TODO list feature tested: 12 passed`) only asks for a result. Apart from that, and from step 4, the label's own words never count. The label can have any number of words.
 
 Judgment calls the rule makes on purpose:
-- An answer that starts with a placeholder is empty: `N/A: docs only`, `WIP: 3/3 pass` and `Pending CI` all count as empty. Write `Docs only, no tests needed` or `3/3 pass` instead.
-- Not decided yet: `N/A` followed by an explanation without a colon (`N/A, no runtime change`, `N/A docs only`) counts as content, while `N/A: docs only` does not. See issue #19 and #36. Letting `N/A <reason>` count whatever the separator was tried and dropped, because deferrals read like reasons (`N/A: later`, `N/A: will run tests`, `N/A (later)`).
+- An answer that starts with a placeholder word, or whose label is only a placeholder, is empty: `WIP: 3/3 pass` and `Pending CI` count as empty. Write `3/3 pass` instead.
+- A bare `N/A` counts as empty. It has no label separator, and step 3.3 treats a line that is only the `N/A` token as empty. `N/A.` and `NA` are empty for the same reason.
+- `N/A, no runtime change` counts as content on purpose. A comma is not a separator, and `N/A` is not a placeholder first word, so the words after the token keep the line. `N/A docs only` is content for the same reason. A colon, a spaced dash, or parentheses does split, and then `N/A` is a placeholder label, so `N/A: docs only`, `N/A - docs only`, and `N/A (docs only)` are empty. Write `No runtime change` or `Docs only, no tests needed` instead of a placeholder label. Counting every `N/A <reason>` as content, whatever the separator, was tried and dropped, because deferrals read like reasons (`N/A: later`, `N/A: will run tests`, `N/A (later)`).
 - A line that starts with a placeholder word needs a reported result after its label to count. So `TODO list feature tested: 12 passed` is filled, but `TODO list feature tested: all pass` is empty. Report the number or say it passed.
 - A placeholder word used as an ordinary noun at the start of a line is still read as a placeholder: `WIP banner verified on staging`, `Todo list tests pass` and `No response received for invalid token, as expected` are empty. Start the line with what was tested, or add a result after a label (`WIP banner: verified on staging, 2 cases pass`).
 - A prose sentence that ends in a placeholder after a colon (`We ran the suite and checked: TODO`) is empty, however long its label.
-- **No clause rescue (fail closed).** A line with a placeholder in a later clause is empty even when an earlier clause reports a result: `Unit: 42 passed, e2e: N/A`, `npm test: 42 passed; integration: N/A` and `All 42 tests passed (TODO: add e2e)` are empty. A rescue (an earlier clause with a result fills the line) was tried and dropped after three rounds of review, because plans and targets read like results (`Will add 3 test cases; e2e: TODO`, `Target 12/12; e2e: TODO`, `Need 12 cases (TODO)`). Report the finished part on its own line. See issues #19 and #36.
+- **No clause rescue (fail closed).** A line with a placeholder in a later clause is empty even when an earlier clause reports a result: `Unit: 42 passed, e2e: N/A`, `npm test: 42 passed; integration: N/A` and `All 42 tests passed (TODO: add e2e)` are empty. A rescue (an earlier clause with a result fills the line) was tried and dropped after three rounds of review, because plans and targets read like results (`Will add 3 test cases; e2e: TODO`, `Target 12/12; e2e: TODO`, `Need 12 cases (TODO)`). Report the finished part on its own line.
 - An unchecked task box (`- [ ] ran the unit tests`) means not done, so the line is empty. Tick the box (`- [x]`) or write the result.
 
 ## Worked examples
@@ -144,6 +145,7 @@ Values are JSON strings. The label and the pieces are what step 2 produces after
 | `"N/A - docs only"` | `N/A` (a placeholder label) | `docs only` | empty |
 | `"N/A (docs only)"` | `N/A` (a placeholder label) | `docs only` | empty |
 | `"N/A docs only"` | none | `N/A docs only` (more than placeholder tokens) | filled |
+| `"N/A, no runtime change"` | none | `N/A, no runtime change` (a comma is not a separator) | filled |
 | `"N/A."` | none | only a token | empty |
 | `"N/A: none"` | `N/A` (a placeholder label) | `none` | empty |
 | `"N/A: TODO"` | `N/A` (a placeholder label) | `TODO` | empty |

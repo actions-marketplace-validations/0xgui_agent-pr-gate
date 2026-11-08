@@ -1,5 +1,8 @@
+import { Minimatch } from 'minimatch';
 import { describe, expect, it } from 'vitest';
-import { parseConfig } from '../src/config';
+import { codeownersMatch } from '../src/codeowners';
+import { defaultConfig, parseConfig } from '../src/config';
+import { gateControlTouched } from '../src/gate';
 import { classify, classifyFile } from '../src/tiers';
 
 const cfg = parseConfig(`default_tier: medium
@@ -56,6 +59,16 @@ describe('tier matcher', () => {
     const c = parseConfig('default_tier: low\ntiers:\n  high: ["infra/**"]\n');
     expect(classify(['misc.txt'], c).tier).toBe('low');
     expect(classify(['misc.txt', 'infra/main.tf'], c).tier).toBe('high');
+  });
+
+  it('keeps **/.. patterns off minimatch optimization level 2', () => {
+    expect(() => parseConfig('tiers:\n  high: ["src/**/../**/*.ts"]\n')).toThrow(/path segment/);
+    const compiled = new Minimatch('**/../a/b', { dot: true });
+    expect(compiled.options.optimizationLevel ?? 1).toBe(1);
+    expect(compiled.set).toHaveLength(1);
+    expect(codeownersMatch('pre/../a/b', '**/../a/b')).toBe(true);
+    expect(codeownersMatch('x/a/b', '**/../a/b')).toBe(false);
+    expect(gateControlTouched(defaultConfig('.review-gate.yml'), ['dist/index.js', 'README.md'])).toEqual(['dist/index.js']);
   });
 });
 

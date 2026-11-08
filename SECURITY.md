@@ -22,4 +22,6 @@ A wrong verdict on an unusual PR description is usually a bug, not a vulnerabili
 
 ## Supported versions
 
-Only the latest commit on `main` gets fixes. There are no tagged releases yet.
+Tagged releases exist. The latest published GitHub Release is [v1.0.3](https://github.com/0xgui/agent-pr-gate/releases/tag/v1.0.3) (2026-10-28). The annotated tag `v1.0.3` points at commit `4dd96034b7e99d613b03c4eceb38264e349c442a`. The moving tag `v1` points at that same commit. [v1.0.2](https://github.com/0xgui/agent-pr-gate/releases/tag/v1.0.2) (2026-10-22) is also published, at commit `b8f3228e83e7ae46fb2b74bbfe22d09de8b6c39a`. Annotated tags `v1.0.0` and `v1.0.1` exist and were not published as GitHub Releases.
+
+Fixes are commits on `main`. A tag contains a fix only when that tag's commit already has it. No support window, maintenance branch, or commitment to patch older tags is published.
