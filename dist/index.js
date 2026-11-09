@@ -31916,6 +31916,7 @@ var path2 = __toESM(require("path"));
 // src/config.ts
 var import_yaml = __toESM(require_dist());
 var TIERS = ["low", "medium", "high"];
+var GATE_MODES = ["team", "solo"];
 var DEFAULT_SECTIONS = [
   { name: "Testing", aliases: ["Tests", "Test plan"] },
   { name: "Risk", aliases: ["Risks"] },
@@ -31924,6 +31925,7 @@ var DEFAULT_SECTIONS = [
 function defaultConfig(path3 = ".review-gate.yml") {
   return {
     path: path3,
+    mode: "team",
     defaultTier: "medium",
     tiers: { low: [], medium: [], high: [] },
     sections: DEFAULT_SECTIONS.map((s) => ({ ...s, aliases: [...s.aliases] })),
@@ -31947,6 +31949,10 @@ var ConfigError = class extends Error {
 };
 function configRefs(configRef, pr) {
   return { rules: configRef === "head" ? pr.head.sha : pr.base.sha, scope: pr.base.sha };
+}
+function withBaseMode(rules, base) {
+  if (rules.mode === base.mode) return rules;
+  return { ...rules, mode: base.mode };
 }
 function isTier(v) {
   return typeof v === "string" && TIERS.includes(v);
@@ -31994,6 +32000,12 @@ function parseConfig(text, path3 = ".review-gate.yml") {
   const raw = doc.toJS() ?? {};
   if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new ConfigError(`${path3}: top level must be a mapping`);
+  }
+  if (raw.mode !== void 0) {
+    if (raw.mode !== "team" && raw.mode !== "solo") {
+      throw new ConfigError(`mode must be one of ${GATE_MODES.join(", ")}`);
+    }
+    cfg.mode = raw.mode;
   }
   if (raw.default_tier !== void 0) {
     if (!isTier(raw.default_tier)) throw new ConfigError(`default_tier must be one of ${TIERS.join(", ")}`);
@@ -34790,6 +34802,38 @@ function ownerOverrideFor(cfg, author, repoOwner, tier, files) {
   if (touched.length) return no(`the PR changes gate-control files (${touched.slice(0, 5).map((f) => "`" + f + "`").join(", ")}${touched.length > 5 ? ", ..." : ""})`);
   return { owner: author, applies: true };
 }
+function listedOthers(cfg, author, codeowners) {
+  const raw = [
+    ...cfg.maintainers,
+    ...cfg.owners,
+    ...codeowners.owners.users,
+    ...codeowners.owners.teams,
+    ...(codeowners.coverage ?? []).flatMap((c) => c.owners)
+  ];
+  const me = author.toLowerCase();
+  const out = /* @__PURE__ */ new Set();
+  for (const item of raw) {
+    const name = item.replace(/^@/, "");
+    if (name.toLowerCase() !== me) out.add(name);
+  }
+  return [...out];
+}
+function sameLogin(a, b) {
+  return a.replace(/^@/, "").toLowerCase() === b.replace(/^@/, "").toLowerCase();
+}
+function authorIsListedOwner(cfg, author, codeowners, repoOwner) {
+  if (repoOwner && sameLogin(author, repoOwner)) return true;
+  return [...cfg.maintainers, ...cfg.owners, ...codeowners.owners.users].some((name) => sameLogin(name, author));
+}
+function soloFor(cfg, author, codeowners, repoOwner) {
+  if (cfg.mode !== "solo") return { state: "team" };
+  const uncovered = (codeowners.coverage ?? []).some((c) => c.status === "no-owner" || c.status === "team-unknown");
+  if (uncovered) return { state: "held", reason: "a high-tier file has no confirmed owner" };
+  const others = listedOthers(cfg, author, codeowners);
+  if (others.length > 0) return { state: "held", reason: `another owner is listed (${others.slice(0, 3).join(", ")})` };
+  if (!authorIsListedOwner(cfg, author, codeowners, repoOwner)) return { state: "held", reason: "author is not a listed owner" };
+  return { state: "applied" };
+}
 function eligibleReviewers(input) {
   const all = [...input.cfg.maintainers, ...input.codeowners.owners.users, ...input.codeowners.owners.teams];
   return [...new Set(all)].filter((h) => h.toLowerCase() !== input.author.toLowerCase());
@@ -34804,7 +34848,7 @@ function decide(input) {
       section: e.name,
       what: e.status === "missing" ? `Missing "## ${e.name}" section` : `"## ${e.name}" section is empty or only TODO`,
       where: "PR description",
-      fix: `Add a "## ${e.name}" heading with real content (template below). Edit the PR description; no new commit needed.`,
+      fix: e.status === "missing" ? `Add a "## ${e.name}" section with a result. A bare N/A does not count. Write a reason after N/A, for example \`N/A, no runtime change\`.` : `Replace the placeholder in "## ${e.name}". A bare N/A does not count. Write a reason after N/A, for example \`N/A, no runtime change\`. \`N/A: later\` does not count.`,
       who: "author"
     });
   }
@@ -34826,7 +34870,9 @@ function decide(input) {
       who: "reviewer"
     });
   }
-  const need = cfg.approvals[tier.tier];
+  const solo = soloFor(cfg, input.author, codeowners, input.repoOwner);
+  const soloHigh = solo.state === "applied" && tier.tier === "high";
+  const need = soloHigh ? 0 : cfg.approvals[tier.tier];
   const override = input.ownerOverride?.applies === true;
   const waived = [];
   if (override && approvers.length < need) waived.push(`${need} approving review(s)`);
@@ -34846,7 +34892,7 @@ function decide(input) {
       ...onlyAuthor ? { cause: "no-other-reviewer" } : {}
     });
   }
-  if (codeowners.required && !codeowners.satisfied) {
+  if (codeowners.required && !codeowners.satisfied && !soloHigh) {
     const who = [...codeowners.owners.users.map((u) => `@${u}`), ...codeowners.owners.teams.map((t) => `@${t}`)];
     const open2 = (codeowners.coverage ?? []).filter((c) => c.status !== "approved");
     const detail = open2.slice(0, 10).map(
@@ -34886,58 +34932,98 @@ function decide(input) {
 function code(s) {
   return "`" + s.replace(/`/g, "'") + "`";
 }
+function maintainerOption(p, solo, tier) {
+  if (p.cause === "no-other-reviewer" && p.id === "approvals") {
+    return `Set \`routing.approvals.${tier}: 0\`, or set \`mode: solo\` when the author is the sole owner.`;
+  }
+  if (p.cause === "no-other-reviewer" && p.id === "codeowners") {
+    return "Set `routing.high_requires_codeowners: false`, or set `mode: solo` when the author is the sole owner.";
+  }
+  if (p.cause === "no-codeowners-file") {
+    return "Add a CODEOWNERS file on the base branch, or set `routing.high_requires_codeowners: false`.";
+  }
+  if (solo.state === "held" && (p.id === "approvals" || p.id === "codeowners")) {
+    return "Approve the pull request, or set `routing.approvals.high: 0`. `mode: solo` applies only when the author is the sole owner.";
+  }
+  return void 0;
+}
 function renderComment(input, result, humans, state) {
   const { cfg, tier, rounds } = input;
   const lines = [MARKER];
   if (state) lines.push(renderState(state));
   const head = result.pass ? "## \u2705 agent-pr-gate: all requirements met" : "## \u274C agent-pr-gate: blocked";
   lines.push(head, "");
-  if (input.scopeNote) lines.push(`> In scope: ${input.scopeNote}. Scope never skips high-tier or gate-control changes.`, "");
-  if (cfg.missing) lines.push(`> No \`${cfg.path}\` on the base branch, so defaults are in use: every file gets \`${cfg.defaultTier}\`.`, "");
+  const solo = soloFor(cfg, input.author, input.codeowners, input.repoOwner);
+  const ov = input.ownerOverride;
+  if (result.pass) {
+    lines.push("This pull request passed.");
+  } else {
+    lines.push("### What is missing", "");
+    const items = result.problems.map((p) => ({ p, option: maintainerOption(p, solo, tier.tier) }));
+    if (result.roundCapReached) {
+      items.push({
+        p: {
+          id: "rounds:cap",
+          what: "Round cap reached",
+          where: "review rounds",
+          fix: `This pull request has gone through ${rounds.rounds} review and fix rounds. A maintainer decides whether to continue.`,
+          who: "reviewer"
+        },
+        option: "Set `rounds.cap: 0` to turn the cap off. The cap does not by itself fail the pull request."
+      });
+    }
+    items.forEach(({ p, option }, i) => {
+      if (option) {
+        lines.push(
+          `${i + 1}. **${p.fix}**`,
+          "   - Who: maintainer",
+          "   - You cannot fix this by editing the pull request.",
+          `   - Maintainer: ${option}`
+        );
+      } else {
+        lines.push(`${i + 1}. **${p.fix}**`, `   - Who: ${p.who}`);
+      }
+    });
+  }
+  const detail = [];
+  if (input.scopeNote) detail.push(`> In scope: ${input.scopeNote}. Scope never skips high-tier or gate-control changes.`);
+  if (cfg.missing) detail.push(`> No \`${cfg.path}\` on the base branch, so defaults are in use: every file gets \`${cfg.defaultTier}\`.`);
   const reqText = tier.tier === "low" ? "OK to merge once CI is green" : tier.tier === "medium" ? `needs ${result.requiredApprovals} approving review(s)` : `needs ${result.requiredApprovals} approving review${result.requiredApprovals === 1 ? "" : "s"}${input.codeowners.required ? " plus a CODEOWNERS approval" : ""}`;
-  lines.push(`**Risk tier:** \`${tier.tier}\` (${reqText})`);
-  if (tier.forced) lines.push("", `**Why \`${tier.tier}\`:** ${tier.forced}`);
+  detail.push(`**Risk tier:** \`${tier.tier}\` (${reqText})`);
+  if (tier.forced) detail.push(`**Why \`${tier.tier}\`:** ${tier.forced}`);
   if (tier.triggers.length) {
-    lines.push("", `**Why \`${tier.tier}\`:**`);
+    detail.push(`**Why \`${tier.tier}\`:**`);
     for (const t of tier.triggers.slice(0, 10)) {
-      lines.push(
+      detail.push(
         t.glob ? `- ${code(t.file)} matches ${code(t.glob)} (${cfg.path}:${t.line ?? "?"})` : `- ${code(t.file)} matches no tier glob, so it gets default_tier \`${cfg.defaultTier}\``
       );
     }
-    if (tier.triggers.length > 10) lines.push(`- ...and ${tier.triggers.length - 10} more`);
+    if (tier.triggers.length > 10) detail.push(`- ...and ${tier.triggers.length - 10} more`);
   }
-  lines.push("", `**Approvals:** ${input.approvers.length}/${result.requiredApprovals}${input.approvers.length ? ` (${input.approvers.map((a) => "@" + a).join(", ")})` : ""}${result.waived ? " (waived)" : ""}`);
-  const ov = input.ownerOverride;
+  detail.push(`**Approvals:** ${input.approvers.length}/${result.requiredApprovals}${input.approvers.length ? ` (${input.approvers.map((a) => "@" + a).join(", ")})` : ""}${result.waived ? " (waived)" : ""}`);
+  if (solo.state === "applied" && tier.tier === "high") {
+    detail.push("**Solo mode:** applied. The author is the sole owner, so this high-tier PR needs no other approval and no CODEOWNERS approval. Evidence and green CI still apply.");
+  } else if (solo.state === "held" && tier.tier === "high") {
+    detail.push(`**Solo mode:** not applied. ${solo.reason}. Team rules still apply.`);
+  }
   if (ov?.applies && result.waived) {
-    lines.push(`**Owner override:** approvals waived for repo owner @${ov.owner} (\`routing.owner_override\`): ${result.waived.join("; ")}. Evidence, CI and the round cap still apply.`);
+    detail.push(`**Owner override:** approvals waived for repo owner @${ov.owner} (\`routing.owner_override\`): ${result.waived.join("; ")}. Evidence, CI and the round cap still apply.`);
   } else if (ov && !ov.applies && result.problems.some((p) => p.id === "approvals")) {
-    lines.push(`**Owner override:** not applied for @${ov.owner}: ${ov.reason}.`);
+    detail.push(`**Owner override:** not applied for @${ov.owner}: ${ov.reason}.`);
   }
-  if (input.ci) lines.push(`**CI:** ${input.ci.state}`);
-  lines.push(`**Review/fix rounds:** ${rounds.unknown ? `unknown (at least ${rounds.rounds})` : rounds.rounds}/${cfg.roundCap}`);
-  if (result.problems.length) {
-    lines.push("", "### What is missing", "");
-    result.problems.forEach((p, i) => {
-      lines.push(`${i + 1}. **${p.what}**`, `   - Where: ${p.where}`, `   - Fix: ${p.fix}`, `   - Who: ${p.who}`);
-    });
-    const missing = input.evidence.filter((e) => e.status !== "ok").map((e) => e.name);
-    if (missing.length) {
-      const specs = cfg.sections.filter((s) => missing.includes(s.name));
-      lines.push("", "### Paste this into the PR description and replace each TODO", "", "```markdown", sectionTemplate(specs), "```");
-    }
-  } else {
-    lines.push("", "Nothing missing. This PR has the evidence and reviews its tier requires.");
-  }
+  if (input.ci) detail.push(`**CI:** ${input.ci.state}`);
+  detail.push(`**Review/fix rounds:** ${rounds.unknown ? `unknown (at least ${rounds.rounds})` : rounds.rounds}/${cfg.roundCap}`);
   if (result.roundCapReached) {
-    lines.push(
-      "",
-      "### \u{1F6D1} Round cap reached",
-      "",
-      `This PR has gone through ${rounds.rounds} review/fix rounds (cap: ${cfg.roundCap}). Author: step back. Stop pushing incremental fixes and summarize what is still unresolved and why. A human needs to decide whether to continue, re-scope or close this PR.`,
-      "",
-      `Flagged for a human: ${humans.length ? humans.map((h) => "@" + h).join(" ") : "(no maintainers or code owners configured)"}`
+    detail.push(
+      `Round cap reached after ${rounds.rounds} review and fix rounds. A maintainer decides whether to continue. Flagged for ${humans.length ? humans.map((h) => "@" + h).join(" ") : "a maintainer"}.`
     );
   }
+  const missing = input.evidence.filter((e) => e.status !== "ok").map((e) => e.name);
+  if (missing.length) {
+    const specs = cfg.sections.filter((s) => missing.includes(s.name));
+    detail.push("Paste this into the PR description and replace each TODO.", "```markdown", sectionTemplate(specs), "```");
+  }
+  lines.push("", "<details><summary>Details</summary>", "", ...detail, "", "</details>");
   const machine = {
     schema_version: 1,
     gate: result.pass ? "pass" : "blocked",
@@ -34957,7 +35043,8 @@ function renderComment(input, result, humans, state) {
       ...p.cause !== void 0 ? { cause: p.cause } : {}
     })),
     approvals: { have: input.approvers.length, need: result.requiredApprovals },
-    codeowners_required: input.codeowners.required,
+    codeowners_required: input.codeowners.required && !(solo.state === "applied" && tier.tier === "high"),
+    solo: solo.state,
     scope_note: input.scopeNote ?? null,
     owner_override: ov ? ov.applies ? { owner: ov.owner, applied: true, waived: result.waived ?? [] } : { owner: ov.owner, applied: false, reason: ov.reason } : null,
     rounds: { count: rounds.rounds, cap: cfg.roundCap, cap_reached: result.roundCapReached }
@@ -35539,7 +35626,10 @@ async function evaluatePr(octokit, repo, s, prNumber, ciWaitSeconds, scopeNote) 
   const { data: pr } = await octokit.rest.pulls.get({ ...repo, pull_number: prNumber });
   if (pr.state !== "open") return null;
   const author = pr.user?.login ?? "";
-  const cfg = scopeNote ? await scopeConfigFor(octokit, repo, s, pr) : await configFor(octokit, repo, s, pr);
+  let cfg = scopeNote ? await scopeConfigFor(octokit, repo, s, pr) : await configFor(octokit, repo, s, pr);
+  if (!scopeNote && s.configRef === "head") {
+    cfg = withBaseMode(cfg, await scopeConfigFor(octokit, repo, s, pr));
+  }
   const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
   const files = fileObjs.flatMap((f) => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
   const tier = classify(files, cfg, { total: pr.changed_files, seen: fileObjs.length });
@@ -35580,7 +35670,8 @@ async function evaluatePr(octokit, repo, s, prNumber, ciWaitSeconds, scopeNote) 
     ignoredApprovals: { stale: approval.stale, untrusted: approval.untrusted },
     codeowners,
     rounds,
-    ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files)
+    ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files),
+    repoOwner: repo.owner
   };
   if (input.ownerOverride) s.log.info(input.ownerOverride.applies ? `Owner override applies to @${author}.` : `Owner override not applied for @${author}: ${input.ownerOverride.reason}.`);
   const result = decide(input);

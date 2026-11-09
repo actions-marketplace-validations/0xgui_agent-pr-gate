@@ -25,6 +25,7 @@ function input(cfgText: string, files: string[], over: Partial<GateInput> = {}, 
     codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
     rounds: { rounds: 0, openedBy: [] },
     ownerOverride: ownerOverrideFor(cfg, author, repoOwner, tier.tier, files),
+    repoOwner,
     ...over,
   };
 }

@@ -1,5 +1,5 @@
 import type * as github from '@actions/github';
-import { configRefs, defaultConfig, GateConfig, parseConfig, Tier } from './config';
+import { configRefs, defaultConfig, GateConfig, parseConfig, Tier, withBaseMode } from './config';
 import { forcedIntoScope, inScope, ScopePr } from './scope';
 import { classify } from './tiers';
 import { checkEvidence } from './evidence';
@@ -273,7 +273,10 @@ export async function evaluatePr(octokit: Octokit, repo: Repo, s: Settings, prNu
   if (pr.state !== 'open') return null;
   const author = pr.user?.login ?? '';
   // A PR forced into scope could otherwise relax its own rules with config-ref: head (#39).
-  const cfg = scopeNote ? await scopeConfigFor(octokit, repo, s, pr) : await configFor(octokit, repo, s, pr);
+  let cfg = scopeNote ? await scopeConfigFor(octokit, repo, s, pr) : await configFor(octokit, repo, s, pr);
+  if (!scopeNote && s.configRef === 'head') {
+    cfg = withBaseMode(cfg, await scopeConfigFor(octokit, repo, s, pr));
+  }
 
   const fileObjs = await octokit.paginate(octokit.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
   const files = fileObjs.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
@@ -326,6 +329,7 @@ export async function evaluatePr(octokit: Octokit, repo: Repo, s: Settings, prNu
     codeowners,
     rounds,
     ownerOverride: ownerOverrideFor(cfg, author, repo.owner, tier.tier, files),
+    repoOwner: repo.owner,
   };
   if (input.ownerOverride) s.log.info(input.ownerOverride.applies ? `Owner override applies to @${author}.` : `Owner override not applied for @${author}: ${input.ownerOverride.reason}.`);
   const result = decide(input);

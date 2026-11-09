@@ -1,6 +1,6 @@
 {
   "name": "agent-pr-gate",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": true,
   "description": "GitHub Action that gates agent-written PRs before human review: risk tiers, required evidence, reviewer routing.",
   "main": "dist/index.js",
@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "verify": "vitest run test/solo.test.ts test/comment.test.ts",
     "all": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "license": "MIT",

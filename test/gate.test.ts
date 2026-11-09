@@ -56,6 +56,7 @@ describe('gate decision and comment', () => {
     approvers: [],
     codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
     rounds: { rounds: 0, openedBy: [] },
+    repoOwner: 'lead',
     ...over,
   });
 
@@ -148,6 +149,7 @@ describe('missing config notice', () => {
       approvers: [],
       codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
       rounds: { rounds: 0, openedBy: [] },
+      repoOwner: 'agent',
     };
     expect(renderComment(input, decide(input), [])).toContain('No `.review-gate.yml` on the base branch');
   });
@@ -165,6 +167,7 @@ describe('scope note', () => {
       approvers: [],
       codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
       rounds: { rounds: 0, openedBy: [] },
+      repoOwner: 'alice',
       scopeNote: 'changes gate-control files (`.review-gate.yml`)',
     };
     const body = renderComment(input, decide(input), []);
@@ -178,7 +181,7 @@ describe('solo maintainer: requirements that no one but the author can meet', ()
   const noOwners = { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] };
   const mk = (yml: string, over: Partial<GateInput> = {}): GateInput => {
     const cfg = parseConfig(yml);
-    return { cfg, author: 'solo', tier: classify(['.github/workflows/ci.yml'], cfg), evidence, ci: null, approvers: [], codeowners: noOwners, rounds: { rounds: 0, openedBy: [] }, ...over };
+    return { cfg, author: 'solo', tier: classify(['.github/workflows/ci.yml'], cfg), evidence, ci: null, approvers: [], codeowners: noOwners, rounds: { rounds: 0, openedBy: [] }, repoOwner: 'solo', ...over };
   };
   const json = (input: GateInput) => JSON.parse(/```json\n([\s\S]*?)\n```/.exec(renderComment(input, decide(input), []))![1]!);
 

@@ -17,6 +17,7 @@ describe("this repo's review round cap", () => {
     approvers: [],
     codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
     rounds: { rounds, openedBy: [] },
+    repoOwner: '0xgui',
   });
   it('is 2, matching REVIEW_POLICY.md', () => {
     expect(cfg.roundCap).toBe(2);

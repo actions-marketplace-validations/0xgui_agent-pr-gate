@@ -4,6 +4,10 @@ import { LineCounter, parseDocument, isSeq, isScalar } from 'yaml';
 export type Tier = 'low' | 'medium' | 'high';
 export const TIERS: Tier[] = ['low', 'medium', 'high'];
 
+/** `team` is the default. `solo` can waive high-tier reviews when the author is the only listed owner. */
+export type GateMode = 'team' | 'solo';
+export const GATE_MODES: GateMode[] = ['team', 'solo'];
+
 export interface TierGlob {
   /** Normalized glob, as matched. */
   glob: string;
@@ -22,6 +26,8 @@ export interface SectionSpec {
 
 export interface GateConfig {
   path: string;
+  /** Parsed at the config boundary. Missing means `team`. */
+  mode: GateMode;
   defaultTier: Tier;
   tiers: Record<Tier, TierGlob[]>;
   sections: SectionSpec[];
@@ -58,6 +64,7 @@ export const DEFAULT_SECTIONS: SectionSpec[] = [
 export function defaultConfig(path = '.review-gate.yml'): GateConfig {
   return {
     path,
+    mode: 'team',
     defaultTier: 'medium',
     tiers: { low: [], medium: [], high: [] },
     sections: DEFAULT_SECTIONS.map((s) => ({ ...s, aliases: [...s.aliases] })),
@@ -86,6 +93,15 @@ export class ConfigError extends Error {}
  */
 export function configRefs(configRef: string, pr: { base: { sha: string }; head: { sha: string } }): { rules: string; scope: string } {
   return { rules: configRef === 'head' ? pr.head.sha : pr.base.sha, scope: pr.base.sha };
+}
+
+/**
+ * `mode` always comes from the base commit. A pull request cannot turn `solo` on by editing
+ * the head copy, even when `config-ref` is `head`.
+ */
+export function withBaseMode(rules: GateConfig, base: GateConfig): GateConfig {
+  if (rules.mode === base.mode) return rules;
+  return { ...rules, mode: base.mode };
 }
 
 function isTier(v: unknown): v is Tier {
@@ -143,6 +159,13 @@ export function parseConfig(text: string, path = '.review-gate.yml'): GateConfig
   const raw = (doc.toJS() ?? {}) as Record<string, unknown>;
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError(`${path}: top level must be a mapping`);
+  }
+
+  if (raw.mode !== undefined) {
+    if (raw.mode !== 'team' && raw.mode !== 'solo') {
+      throw new ConfigError(`mode must be one of ${GATE_MODES.join(', ')}`);
+    }
+    cfg.mode = raw.mode;
   }
 
   if (raw.default_tier !== undefined) {

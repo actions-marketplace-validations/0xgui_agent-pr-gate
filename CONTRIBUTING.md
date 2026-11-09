@@ -13,7 +13,7 @@ Thank you for helping. This guide covers changes to agent-pr-gate itself. To use
 1. Fork the repository and create a branch from `main`.
 2. Run `npm ci`.
 3. Make the change, with tests. For the evidence rule, change [docs/evidence-rule.md](docs/evidence-rule.md) first, as described in [AGENTS.md](AGENTS.md).
-4. Run `npm run all`. It runs lint, the type check, the tests, and the build.
+4. Run `npm run all`. It runs lint, the type check, the tests, and the build. While you work, `npm test` or the quicker `npm run verify` is enough.
 5. Commit the rebuilt `dist/index.js` and `dist/cli.js` together with your source change.
 6. Open a PR and fill in the template: Summary, Testing, Risk, and How to revert.
 

@@ -36,6 +36,7 @@ describe('#2 #3 approvals (see reviews.test.ts) are wired into the gate comment'
       ignoredApprovals: { stale: ['alice'], untrusted: ['stranger'] },
       codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
       rounds: { rounds: 0, openedBy: [] },
+      repoOwner: 'agent',
     };
     const fix = decide(input).problems.find((p) => p.id === 'approvals')!.fix;
     expect(fix).toContain('Stale (re-approve the latest commit): @alice');
@@ -128,6 +129,7 @@ describe('#9 unknown team membership is reported, not treated as no', () => {
         note: 'Could not confirm membership of @org/infra with this token (404 or no org access). Branch protection must enforce the team review.',
       },
       rounds: { rounds: 0, openedBy: [] },
+      repoOwner: 'agent',
     };
     expect(renderComment(input, decide(input), [])).toContain('Branch protection must enforce the team review');
   });
@@ -236,6 +238,7 @@ describe('C incomplete file list blocks', () => {
       approvers: ['alice', 'bob'],
       codeowners: { required: false, owners: { users: [], teams: [] }, approvedBy: [], satisfied: true, requested: [] },
       rounds: { rounds: 0, openedBy: [] },
+      repoOwner: 'agent',
     };
     const res = decide(input);
     expect(res.pass).toBe(false);
