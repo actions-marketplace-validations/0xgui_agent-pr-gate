@@ -1,0 +1,123 @@
+# Publish a GitHub Release and move the floating major tag when a version tag is pushed.
+# A maintainer or the existing auto-release process pushes vX.Y.Z; this workflow does the rest.
+# It does not publish to the Marketplace, and it does not create or move the version tag itself.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+# One publish at a time so two tags cannot race on the major tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: dist/ is up to date
+        run: |
+          if ! git diff --exit-code -- dist/; then
+            echo "::error::dist/ is stale. Run 'npm run build' and commit dist/."
+            exit 1
+          fi
+      - name: Tag matches package.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a vMAJOR.MINOR.PATCH version tag."
+            exit 1
+          fi
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$pkg" != "${TAG#v}" ]; then
+            echo "::error::package.json version ($pkg) does not match tag $TAG."
+            exit 1
+          fi
+
+  publish:
+    name: publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release and move the major tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a vMAJOR.MINOR.PATCH version tag."
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+          else
+            gh release create "$TAG" --generate-notes --verify-tag
+          fi
+
+          major="${TAG%%.*}"
+          repo="${GITHUB_REPOSITORY}"
+          current=""
+          if current_json="$(gh api "repos/${repo}/git/ref/tags/${major}" 2>/dev/null)"; then
+            typ="$(printf '%s\n' "$current_json" | jq -r .object.type)"
+            current="$(printf '%s\n' "$current_json" | jq -r .object.sha)"
+            if [ "$typ" = "tag" ]; then
+              current="$(gh api "repos/${repo}/git/tags/${current}" --jq .object.sha)"
+            fi
+          fi
+
+          if [ "$current" = "$SHA" ]; then
+            echo "Major tag $major already points at $SHA."
+            exit 0
+          fi
+
+          if [ -n "$current" ]; then
+            prev=""
+            while IFS=$'\t' read -r ref sha typ; do
+              [ -n "$ref" ] || continue
+              name="${ref#refs/tags/}"
+              [[ "$name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+              peeled="$sha"
+              if [ "$typ" = "tag" ]; then
+                peeled="$(gh api "repos/${repo}/git/tags/${sha}" --jq .object.sha)"
+              fi
+              if [ "$peeled" = "$current" ]; then
+                if [ -z "$prev" ] || [ "$(printf '%s\n' "$prev" "$name" | sort -V | tail -n1)" = "$name" ]; then
+                  prev="$name"
+                fi
+              fi
+            done < <(gh api "repos/${repo}/git/matching-refs/tags/${major}." --jq '.[] | [.ref, .object.sha, .object.type] | @tsv')
+            if [ -n "$prev" ] && [ "$(printf '%s\n' "$TAG" "$prev" | sort -V | tail -n1)" != "$TAG" ]; then
+              echo "::error::Refusing to move $major backwards from $prev ($current) to $TAG ($SHA)."
+              exit 1
+            fi
+            gh api --method PATCH "repos/${repo}/git/refs/tags/${major}" -f sha="$SHA" -F force=true
+            echo "Moved $major to $SHA."
+          else
+            gh api --method POST "repos/${repo}/git/refs" -f ref="refs/tags/${major}" -f sha="$SHA"
+            echo "Created $major at $SHA."
+          fi

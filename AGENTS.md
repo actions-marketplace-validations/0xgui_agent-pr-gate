@@ -36,6 +36,7 @@ agent-pr-gate is a TypeScript GitHub Action that runs on Node 24 (`runs.using: n
 | `.review-gate.yml` | This repository's own gate config: tiers, approvals, owner override, round cap |
 | `.github/workflows/ci.yml` | Lint, types, tests, build, and a check that `dist/` is fresh |
 | `.github/workflows/gate.yml` | This repository's own gate run. A smoke test, not a required check |
+| `.github/workflows/release.yml` | On a `vX.Y.Z` tag: verify the build and `dist/`, create the GitHub Release, and move the floating major tag (`v1`) |
 
 ## Check your change
 
@@ -109,7 +110,7 @@ The required sections are Testing, Risk, and How to revert (aliases `Rollback` a
 - Don't loosen the evidence rule without the spec-first steps above.
 - Don't add a dependency on an outside service. The action talks only to the GitHub API.
 - Don't check out or run PR code in a gate workflow, or widen the permissions in `examples/` or the README.
-- Don't change a pinned action SHA or the version in `package.json` in a feature PR. A release bumps them in its own PR.
+- Don't change a pinned action SHA or the version in `package.json` in a feature PR. A release bumps them in its own PR. After that PR is on `main`, a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which verifies `dist/`, creates the GitHub Release, and moves the floating major tag (`v1`).
 - Don't commit secrets, tokens, local paths, logs, or editor and agent tool directories. `.gitignore` covers the common ones.
 
 ## Follow the review policy
